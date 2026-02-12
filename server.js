@@ -749,8 +749,17 @@ app.delete('/api/reminders/:id', authenticateToken, async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => {
+app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// Root route
+app.get('/', (req, res) => {
+    res.json({
+        message: 'Numbers API Server',
+        version: '1.0.0',
+        endpoints: ['/api/auth/register', '/api/auth/login', '/api/health']
+    });
 });
 
 // Start server
