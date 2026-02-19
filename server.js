@@ -455,6 +455,8 @@ app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Cliente non trovato' });
         }
 
+        // Set customer_id to NULL on invoices before deleting (preserve invoice history)
+        await pool.query('UPDATE invoices SET customer_id = NULL WHERE customer_id = $1', [id]);
         await pool.query('DELETE FROM customers WHERE id = $1', [id]);
         res.json({ message: 'Cliente eliminato con successo' });
     } catch (error) {
@@ -477,7 +479,7 @@ app.get('/api/companies/:companyId/invoices', authenticateToken, async (req, res
         }
 
         const result = await pool.query(
-            'SELECT i.*, c.name as customer_name FROM invoices i JOIN customers c ON i.customer_id = c.id WHERE i.company_id = $1 ORDER BY i.date DESC',
+            'SELECT i.*, c.name as customer_name FROM invoices i LEFT JOIN customers c ON i.customer_id = c.id WHERE i.company_id = $1 ORDER BY i.date DESC',
             [companyId]
         );
         res.json(result.rows);
@@ -550,6 +552,8 @@ app.delete('/api/invoices/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Fattura non trovata' });
         }
 
+        // Set invoice_id to NULL on reminders before deleting (preserve reminder history)
+        await pool.query('UPDATE reminders SET invoice_id = NULL WHERE invoice_id = $1', [id]);
         await pool.query('DELETE FROM invoices WHERE id = $1', [id]);
         res.json({ message: 'Fattura eliminata con successo' });
     } catch (error) {
@@ -762,9 +766,52 @@ app.get('/', (req, res) => {
     });
 });
 
+// Migrations
+async function runMigrations() {
+    const results = [];
+
+    // Migration 1: invoices.customer_id → allow NULL, SET NULL on customer delete
+    try {
+        await pool.query(`ALTER TABLE invoices ALTER COLUMN customer_id DROP NOT NULL`);
+        results.push('M1a: customer_id NOT NULL dropped');
+    } catch (e) { results.push('M1a skipped: ' + e.message); }
+    try {
+        await pool.query(`ALTER TABLE invoices DROP CONSTRAINT IF EXISTS invoices_customer_id_fkey`);
+        results.push('M1b: old fkey dropped');
+    } catch (e) { results.push('M1b skipped: ' + e.message); }
+    try {
+        await pool.query(`ALTER TABLE invoices ADD CONSTRAINT invoices_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE SET NULL`);
+        results.push('M1c: new fkey SET NULL added ✅');
+    } catch (e) { results.push('M1c skipped: ' + e.message); }
+
+    // Migration 2: reminders.invoice_id → allow NULL, SET NULL on invoice delete
+    try {
+        await pool.query(`ALTER TABLE reminders ALTER COLUMN invoice_id DROP NOT NULL`);
+        results.push('M2a: invoice_id NOT NULL dropped');
+    } catch (e) { results.push('M2a skipped: ' + e.message); }
+    try {
+        await pool.query(`ALTER TABLE reminders DROP CONSTRAINT IF EXISTS reminders_invoice_id_fkey`);
+        results.push('M2b: old fkey dropped');
+    } catch (e) { results.push('M2b skipped: ' + e.message); }
+    try {
+        await pool.query(`ALTER TABLE reminders ADD CONSTRAINT reminders_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE SET NULL`);
+        results.push('M2c: new fkey SET NULL added ✅');
+    } catch (e) { results.push('M2c skipped: ' + e.message); }
+
+    console.log('Migrations:', results.join(' | '));
+    return results;
+}
+
+// Manual migration endpoint (for debugging)
+app.get('/api/migrate', async (req, res) => {
+    const results = await runMigrations();
+    res.json({ results });
+});
+
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`🚀 Numbers server running on port ${PORT}`);
+    await runMigrations();
 });
 
 // Graceful shutdown
