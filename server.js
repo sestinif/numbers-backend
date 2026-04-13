@@ -6,6 +6,7 @@ const { Pool } = require('pg');
 const { body, validationResult } = require('express-validator');
 const crypto = require('crypto');
 const sgMail = require('@sendgrid/mail');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 // Configure SendGrid
@@ -16,19 +17,47 @@ if (process.env.SENDGRID_API_KEY) {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
+// CORS - solo origini autorizzate
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
+    : ['http://localhost:3000'];
+
+app.use(cors({
+    origin: function (origin, callback) {
+        // Permetti richieste senza origin (es. curl, Postman, same-origin)
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Non autorizzato da CORS'));
+        }
+    },
+    credentials: true
+}));
+
 app.use(express.json());
 app.use(express.static('../frontend'));
+
+// Rate limiting - protezione brute force
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minuti
+    max: 20, // max 20 tentativi per finestra
+    message: { error: 'Troppi tentativi. Riprova tra 15 minuti.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 
 // Database connection
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false
 });
 
-// JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
+// JWT Secret - nessun fallback insicuro
+if (!process.env.JWT_SECRET) {
+    console.error('ERRORE: JWT_SECRET non configurato! Imposta la variabile d\'ambiente.');
+    process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 
 // Auth middleware
 const authenticateToken = (req, res, next) => {
@@ -51,7 +80,7 @@ const authenticateToken = (req, res, next) => {
 // ============= AUTH ROUTES =============
 
 // Register
-app.post('/api/auth/register', [
+app.post('/api/auth/register', authLimiter, [
     body('email').isEmail().normalizeEmail(),
     body('password').isLength({ min: 6 }),
     body('name').optional().trim()
@@ -82,7 +111,7 @@ app.post('/api/auth/register', [
         const user = result.rows[0];
 
         // Generate token
-        const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+        const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 
         res.status(201).json({ user, token });
     } catch (error) {
@@ -92,7 +121,7 @@ app.post('/api/auth/register', [
 });
 
 // Login
-app.post('/api/auth/login', [
+app.post('/api/auth/login', authLimiter, [
     body('email').isEmail().normalizeEmail(),
     body('password').notEmpty()
 ], async (req, res) => {
@@ -119,7 +148,7 @@ app.post('/api/auth/login', [
         }
 
         // Generate token
-        const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+        const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 
         res.json({
             user: {
@@ -154,7 +183,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 });
 
 // Forgot Password - Request reset
-app.post('/api/auth/forgot-password', [
+app.post('/api/auth/forgot-password', authLimiter, [
     body('email').isEmail().normalizeEmail()
 ], async (req, res) => {
     const errors = validationResult(req);
@@ -177,17 +206,23 @@ app.post('/api/auth/forgot-password', [
 
         // Generate reset token
         const resetToken = crypto.randomBytes(32).toString('hex');
+        const tokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
         const expiresAt = new Date(Date.now() + 3600000); // 1 hour
 
-        // Save token to database
+        // Save hashed token to database
         await pool.query(
             'INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)',
-            [user.id, resetToken, expiresAt]
+            [user.id, tokenHash, expiresAt]
         );
 
         // Send email with SendGrid
         if (process.env.SENDGRID_API_KEY) {
             const resetUrl = `${process.env.APP_URL || 'http://localhost:3000'}/reset-password.html?token=${resetToken}`;
+
+            // Escape user name per prevenire XSS nell'email
+            const safeName = (user.name || 'User').replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[c]);
 
             const msg = {
                 to: user.email,
@@ -202,7 +237,7 @@ app.post('/api/auth/forgot-password', [
                         <div style="background: #1A1A1A; border-radius: 16px; padding: 30px; border: 1px solid #2A2A2A;">
                             <h2 style="color: #00FF00; margin-bottom: 20px;">Reset Password</h2>
                             <p style="color: #A0A0A0; line-height: 1.6; margin-bottom: 20px;">
-                                Ciao ${user.name || 'User'},<br><br>
+                                Ciao ${safeName},<br><br>
                                 Hai richiesto di resettare la tua password. Clicca il pulsante qui sotto per procedere:
                             </p>
                             <div style="text-align: center; margin: 30px 0;">
@@ -215,7 +250,7 @@ app.post('/api/auth/forgot-password', [
                                 <a href="${resetUrl}" style="color: #00FF00; word-break: break-all;">${resetUrl}</a>
                             </p>
                             <p style="color: #A0A0A0; font-size: 13px; margin-top: 20px; padding-top: 20px; border-top: 1px solid #2A2A2A;">
-                                ⚠️ Questo link scade tra 1 ora.<br>
+                                Questo link scade tra 1 ora.<br>
                                 Se non hai richiesto questo reset, ignora questa email.
                             </p>
                         </div>
@@ -234,7 +269,7 @@ app.post('/api/auth/forgot-password', [
 });
 
 // Reset Password - Verify token and update password
-app.post('/api/auth/reset-password', [
+app.post('/api/auth/reset-password', authLimiter, [
     body('token').notEmpty(),
     body('newPassword').isLength({ min: 6 })
 ], async (req, res) => {
@@ -246,10 +281,13 @@ app.post('/api/auth/reset-password', [
     const { token, newPassword } = req.body;
 
     try {
+        // Hash the incoming token to compare with stored hash
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+
         // Find valid token
         const tokenResult = await pool.query(
             'SELECT * FROM password_reset_tokens WHERE token = $1 AND used = FALSE AND expires_at > NOW()',
-            [token]
+            [tokenHash]
         );
 
         if (tokenResult.rows.length === 0) {
@@ -492,7 +530,12 @@ app.get('/api/companies/:companyId/invoices', authenticateToken, async (req, res
 // Create invoice
 app.post('/api/companies/:companyId/invoices', authenticateToken, async (req, res) => {
     const { companyId } = req.params;
-    const { customer_id, invoice_number, date, due_date, items, subtotal, tax, total, status, notes } = req.body;
+    const { customer_id, invoice_number, date, due_date, items, subtotal, tax, total, status, notes, currency } = req.body;
+
+    // Validazione numerica
+    if (isNaN(parseFloat(subtotal)) || isNaN(parseFloat(total))) {
+        return res.status(400).json({ error: 'Subtotale e totale devono essere numeri validi' });
+    }
 
     try {
         // Check ownership
@@ -502,8 +545,8 @@ app.post('/api/companies/:companyId/invoices', authenticateToken, async (req, re
         }
 
         const result = await pool.query(
-            'INSERT INTO invoices (company_id, customer_id, invoice_number, date, due_date, items, subtotal, tax, total, status, notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
-            [companyId, customer_id, invoice_number, date, due_date, JSON.stringify(items), subtotal, tax, total, status, notes]
+            'INSERT INTO invoices (company_id, customer_id, invoice_number, date, due_date, items, subtotal, tax, total, status, notes, currency) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *',
+            [companyId, customer_id, invoice_number, date, due_date, JSON.stringify(items), subtotal, tax, total, status, notes, currency || 'EUR']
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -515,7 +558,12 @@ app.post('/api/companies/:companyId/invoices', authenticateToken, async (req, re
 // Update invoice
 app.put('/api/invoices/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { customer_id, invoice_number, date, due_date, items, subtotal, tax, total, status, notes } = req.body;
+    const { customer_id, invoice_number, date, due_date, items, subtotal, tax, total, status, notes, currency } = req.body;
+
+    // Validazione numerica
+    if (isNaN(parseFloat(subtotal)) || isNaN(parseFloat(total))) {
+        return res.status(400).json({ error: 'Subtotale e totale devono essere numeri validi' });
+    }
 
     try {
         // Check ownership
@@ -528,8 +576,8 @@ app.put('/api/invoices/:id', authenticateToken, async (req, res) => {
         }
 
         const result = await pool.query(
-            'UPDATE invoices SET customer_id = $1, invoice_number = $2, date = $3, due_date = $4, items = $5, subtotal = $6, tax = $7, total = $8, status = $9, notes = $10, updated_at = CURRENT_TIMESTAMP WHERE id = $11 RETURNING *',
-            [customer_id, invoice_number, date, due_date, JSON.stringify(items), subtotal, tax, total, status, notes, id]
+            'UPDATE invoices SET customer_id = $1, invoice_number = $2, date = $3, due_date = $4, items = $5, subtotal = $6, tax = $7, total = $8, status = $9, notes = $10, currency = $11, updated_at = CURRENT_TIMESTAMP WHERE id = $12 RETURNING *',
+            [customer_id, invoice_number, date, due_date, JSON.stringify(items), subtotal, tax, total, status, notes, currency || 'EUR', id]
         );
         res.json(result.rows[0]);
     } catch (error) {
@@ -591,6 +639,13 @@ app.post('/api/companies/:companyId/expenses', authenticateToken, async (req, re
     const { companyId } = req.params;
     const { description, amount, category, date, notes } = req.body;
 
+    if (!description || !description.trim()) {
+        return res.status(400).json({ error: 'La descrizione è obbligatoria' });
+    }
+    if (isNaN(parseFloat(amount)) || parseFloat(amount) < 0) {
+        return res.status(400).json({ error: 'L\'importo deve essere un numero valido' });
+    }
+
     try {
         // Check ownership
         const check = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
@@ -613,6 +668,10 @@ app.post('/api/companies/:companyId/expenses', authenticateToken, async (req, re
 app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { description, amount, category, date, notes } = req.body;
+
+    if (isNaN(parseFloat(amount)) || parseFloat(amount) < 0) {
+        return res.status(400).json({ error: 'L\'importo deve essere un numero valido' });
+    }
 
     try {
         // Check ownership
@@ -784,7 +843,13 @@ async function runMigrations() {
         results.push('M1c: new fkey SET NULL added ✅');
     } catch (e) { results.push('M1c skipped: ' + e.message); }
 
-    // Migration 2: reminders.invoice_id → allow NULL, SET NULL on invoice delete
+    // Migration 2: invoices.currency → aggiunge colonna currency
+    try {
+        await pool.query(`ALTER TABLE invoices ADD COLUMN currency VARCHAR(10) DEFAULT 'EUR'`);
+        results.push('M2: currency column added');
+    } catch (e) { results.push('M2 skipped: ' + e.message); }
+
+    // Migration 3: reminders.invoice_id → allow NULL, SET NULL on invoice delete
     try {
         await pool.query(`ALTER TABLE reminders ALTER COLUMN invoice_id DROP NOT NULL`);
         results.push('M2a: invoice_id NOT NULL dropped');
@@ -802,21 +867,23 @@ async function runMigrations() {
     return results;
 }
 
-// Manual migration endpoint (for debugging)
-app.get('/api/migrate', async (req, res) => {
+// Manual migration endpoint (protetto, solo con autenticazione)
+app.get('/api/migrate', authenticateToken, async (req, res) => {
     const results = await runMigrations();
     res.json({ results });
 });
 
 // Start server
-app.listen(PORT, async () => {
-    console.log(`🚀 Numbers server running on port ${PORT}`);
+const server = app.listen(PORT, async () => {
+    console.log(`Numbers server running on port ${PORT}`);
     await runMigrations();
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM signal received: closing HTTP server');
-    pool.end();
-    process.exit(0);
+    server.close(() => {
+        pool.end();
+        process.exit(0);
+    });
 });
