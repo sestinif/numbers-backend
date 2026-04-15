@@ -811,6 +811,89 @@ app.delete('/api/reminders/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// ============= EXPENSE NOTES (RIMBORSI) ROUTES =============
+
+// Get all expense notes for company
+app.get('/api/companies/:companyId/expense-notes', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        const check = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Azienda non trovata' });
+        }
+        const result = await pool.query(
+            'SELECT * FROM expense_notes WHERE company_id = $1 ORDER BY created_at DESC',
+            [companyId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Errore get expense notes:', error);
+        res.status(500).json({ error: 'Errore nel recupero note spese' });
+    }
+});
+
+// Create expense note
+app.post('/api/companies/:companyId/expense-notes', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    const { description, amount, action_type, customer_name, date, notes } = req.body;
+    try {
+        const check = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Azienda non trovata' });
+        }
+        const result = await pool.query(
+            'INSERT INTO expense_notes (company_id, description, amount, action_type, customer_name, date, notes, completed) VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE) RETURNING *',
+            [companyId, description, amount, action_type || 'reimburse', customer_name, date, notes]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Errore create expense note:', error);
+        res.status(500).json({ error: 'Errore nella creazione nota spesa' });
+    }
+});
+
+// Update expense note
+app.put('/api/expense-notes/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { description, amount, action_type, customer_name, date, notes, completed } = req.body;
+    try {
+        const check = await pool.query(
+            'SELECT n.id FROM expense_notes n JOIN companies co ON n.company_id = co.id WHERE n.id = $1 AND co.user_id = $2',
+            [id, req.user.id]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Nota spesa non trovata' });
+        }
+        const result = await pool.query(
+            'UPDATE expense_notes SET description = $1, amount = $2, action_type = $3, customer_name = $4, date = $5, notes = $6, completed = $7, updated_at = CURRENT_TIMESTAMP WHERE id = $8 RETURNING *',
+            [description, amount, action_type, customer_name, date, notes, completed, id]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Errore update expense note:', error);
+        res.status(500).json({ error: 'Errore nell\'aggiornamento nota spesa' });
+    }
+});
+
+// Delete expense note
+app.delete('/api/expense-notes/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const check = await pool.query(
+            'SELECT n.id FROM expense_notes n JOIN companies co ON n.company_id = co.id WHERE n.id = $1 AND co.user_id = $2',
+            [id, req.user.id]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Nota spesa non trovata' });
+        }
+        await pool.query('DELETE FROM expense_notes WHERE id = $1', [id]);
+        res.json({ message: 'Nota spesa eliminata con successo' });
+    } catch (error) {
+        console.error('Errore delete expense note:', error);
+        res.status(500).json({ error: 'Errore nell\'eliminazione nota spesa' });
+    }
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
@@ -862,6 +945,24 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE reminders ADD CONSTRAINT reminders_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE SET NULL`);
         results.push('M2c: new fkey SET NULL added ✅');
     } catch (e) { results.push('M2c skipped: ' + e.message); }
+
+    // Migration 4: expense_notes table
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS expense_notes (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            description VARCHAR(255) NOT NULL,
+            amount DECIMAL(10, 2) NOT NULL,
+            action_type VARCHAR(50) DEFAULT 'reimburse',
+            customer_name VARCHAR(255),
+            date DATE,
+            notes TEXT,
+            completed BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        results.push('M4: expense_notes table created');
+    } catch (e) { results.push('M4 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
