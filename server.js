@@ -7,7 +7,19 @@ const { body, validationResult } = require('express-validator');
 const crypto = require('crypto');
 const sgMail = require('@sendgrid/mail');
 const rateLimit = require('express-rate-limit');
+const multer = require('multer');
 require('dotenv').config();
+
+// Multer: memory storage, 5MB max, only images/pdf
+const receiptUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        const ok = /^image\/(png|jpe?g|gif|webp|heic|heif)$|^application\/pdf$/i.test(file.mimetype);
+        if (!ok) return cb(new Error('Formato non supportato. Solo immagini o PDF.'));
+        cb(null, true);
+    }
+});
 
 // Configure SendGrid
 if (process.env.SENDGRID_API_KEY) {
@@ -822,7 +834,12 @@ app.get('/api/companies/:companyId/expense-notes', authenticateToken, async (req
             return res.status(404).json({ error: 'Azienda non trovata' });
         }
         const result = await pool.query(
-            'SELECT * FROM expense_notes WHERE company_id = $1 ORDER BY created_at DESC',
+            `SELECT n.*, COALESCE(r.cnt, 0)::int AS receipts_count
+             FROM expense_notes n
+             LEFT JOIN (SELECT expense_note_id, COUNT(*) AS cnt FROM expense_note_receipts GROUP BY expense_note_id) r
+               ON r.expense_note_id = n.id
+             WHERE n.company_id = $1
+             ORDER BY n.created_at DESC`,
             [companyId]
         );
         res.json(result.rows);
@@ -894,6 +911,110 @@ app.delete('/api/expense-notes/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// ============= EXPENSE NOTE RECEIPTS ROUTES =============
+
+// Helper: verify expense note belongs to authenticated user
+async function checkNoteOwnership(noteId, userId) {
+    const r = await pool.query(
+        'SELECT n.id FROM expense_notes n JOIN companies co ON n.company_id = co.id WHERE n.id = $1 AND co.user_id = $2',
+        [noteId, userId]
+    );
+    return r.rows.length > 0;
+}
+
+// List receipts for a note (metadata only, no blob)
+app.get('/api/expense-notes/:id/receipts', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        if (!(await checkNoteOwnership(id, req.user.id))) {
+            return res.status(404).json({ error: 'Nota spesa non trovata' });
+        }
+        const result = await pool.query(
+            'SELECT id, filename, mime_type, size_bytes, created_at FROM expense_note_receipts WHERE expense_note_id = $1 ORDER BY created_at ASC',
+            [id]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Errore get receipts:', error);
+        res.status(500).json({ error: 'Errore nel recupero ricevute' });
+    }
+});
+
+// Upload one or more receipts for a note
+app.post('/api/expense-notes/:id/receipts', authenticateToken, (req, res) => {
+    receiptUpload.array('files', 10)(req, res, async (err) => {
+        if (err) return res.status(400).json({ error: err.message });
+        const { id } = req.params;
+        try {
+            if (!(await checkNoteOwnership(id, req.user.id))) {
+                return res.status(404).json({ error: 'Nota spesa non trovata' });
+            }
+            if (!req.files || req.files.length === 0) {
+                return res.status(400).json({ error: 'Nessun file caricato' });
+            }
+            const inserted = [];
+            for (const f of req.files) {
+                const r = await pool.query(
+                    'INSERT INTO expense_note_receipts (expense_note_id, filename, mime_type, size_bytes, file_data) VALUES ($1, $2, $3, $4, $5) RETURNING id, filename, mime_type, size_bytes, created_at',
+                    [id, f.originalname, f.mimetype, f.size, f.buffer]
+                );
+                inserted.push(r.rows[0]);
+            }
+            res.status(201).json(inserted);
+        } catch (error) {
+            console.error('Errore upload receipts:', error);
+            res.status(500).json({ error: 'Errore nel caricamento ricevute' });
+        }
+    });
+});
+
+// Download a single receipt (returns the file inline)
+app.get('/api/receipts/:receiptId', authenticateToken, async (req, res) => {
+    const { receiptId } = req.params;
+    try {
+        const r = await pool.query(
+            `SELECT r.filename, r.mime_type, r.file_data
+             FROM expense_note_receipts r
+             JOIN expense_notes n ON r.expense_note_id = n.id
+             JOIN companies co ON n.company_id = co.id
+             WHERE r.id = $1 AND co.user_id = $2`,
+            [receiptId, req.user.id]
+        );
+        if (r.rows.length === 0) {
+            return res.status(404).json({ error: 'Ricevuta non trovata' });
+        }
+        const row = r.rows[0];
+        res.setHeader('Content-Type', row.mime_type);
+        res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(row.filename)}"`);
+        res.send(row.file_data);
+    } catch (error) {
+        console.error('Errore download receipt:', error);
+        res.status(500).json({ error: 'Errore nel download ricevuta' });
+    }
+});
+
+// Delete a receipt
+app.delete('/api/receipts/:receiptId', authenticateToken, async (req, res) => {
+    const { receiptId } = req.params;
+    try {
+        const r = await pool.query(
+            `SELECT r.id FROM expense_note_receipts r
+             JOIN expense_notes n ON r.expense_note_id = n.id
+             JOIN companies co ON n.company_id = co.id
+             WHERE r.id = $1 AND co.user_id = $2`,
+            [receiptId, req.user.id]
+        );
+        if (r.rows.length === 0) {
+            return res.status(404).json({ error: 'Ricevuta non trovata' });
+        }
+        await pool.query('DELETE FROM expense_note_receipts WHERE id = $1', [receiptId]);
+        res.json({ message: 'Ricevuta eliminata' });
+    } catch (error) {
+        console.error('Errore delete receipt:', error);
+        res.status(500).json({ error: 'Errore nell\'eliminazione ricevuta' });
+    }
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
@@ -945,6 +1066,21 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE reminders ADD CONSTRAINT reminders_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE SET NULL`);
         results.push('M2c: new fkey SET NULL added ✅');
     } catch (e) { results.push('M2c skipped: ' + e.message); }
+
+    // Migration 5: expense_note_receipts table (file BLOBs)
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS expense_note_receipts (
+            id SERIAL PRIMARY KEY,
+            expense_note_id INTEGER NOT NULL REFERENCES expense_notes(id) ON DELETE CASCADE,
+            filename VARCHAR(255) NOT NULL,
+            mime_type VARCHAR(100) NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            file_data BYTEA NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_receipts_note_id ON expense_note_receipts(expense_note_id)`);
+        results.push('M5: expense_note_receipts table created ✅');
+    } catch (e) { results.push('M5 skipped: ' + e.message); }
 
     // Migration 4: expense_notes table
     try {
