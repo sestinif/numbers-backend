@@ -872,7 +872,7 @@ app.post('/api/companies/:companyId/expense-notes', authenticateToken, async (re
 // Update expense note
 app.put('/api/expense-notes/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { description, amount, action_type, customer_name, date, notes, completed } = req.body;
+    const { description, amount, action_type, customer_name, date, notes, completed, invoice_id } = req.body;
     try {
         const check = await pool.query(
             'SELECT n.id FROM expense_notes n JOIN companies co ON n.company_id = co.id WHERE n.id = $1 AND co.user_id = $2',
@@ -882,8 +882,8 @@ app.put('/api/expense-notes/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Nota spesa non trovata' });
         }
         const result = await pool.query(
-            'UPDATE expense_notes SET description = $1, amount = $2, action_type = $3, customer_name = $4, date = $5, notes = $6, completed = $7, updated_at = CURRENT_TIMESTAMP WHERE id = $8 RETURNING *',
-            [description, amount, action_type, customer_name, date, notes, completed, id]
+            'UPDATE expense_notes SET description = $1, amount = $2, action_type = $3, customer_name = $4, date = $5, notes = $6, completed = $7, invoice_id = $8, updated_at = CURRENT_TIMESTAMP WHERE id = $9 RETURNING *',
+            [description, amount, action_type, customer_name, date, notes, completed, invoice_id !== undefined ? invoice_id : null, id]
         );
         res.json(result.rows[0]);
     } catch (error) {
@@ -966,6 +966,32 @@ app.post('/api/expense-notes/:id/receipts', authenticateToken, (req, res) => {
             res.status(500).json({ error: 'Errore nel caricamento ricevute' });
         }
     });
+});
+
+// List all receipts attached to expense notes linked to an invoice
+app.get('/api/invoices/:invoiceId/receipts', authenticateToken, async (req, res) => {
+    const { invoiceId } = req.params;
+    try {
+        const check = await pool.query(
+            'SELECT i.id FROM invoices i JOIN companies co ON i.company_id = co.id WHERE i.id = $1 AND co.user_id = $2',
+            [invoiceId, req.user.id]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Fattura non trovata' });
+        }
+        const result = await pool.query(
+            `SELECT r.id, r.filename, r.mime_type, r.size_bytes, n.description AS note_description
+             FROM expense_note_receipts r
+             JOIN expense_notes n ON r.expense_note_id = n.id
+             WHERE n.invoice_id = $1
+             ORDER BY r.created_at ASC`,
+            [invoiceId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Errore get invoice receipts:', error);
+        res.status(500).json({ error: 'Errore nel recupero ricevute fattura' });
+    }
 });
 
 // Download a single receipt (returns the file inline)
@@ -1066,6 +1092,12 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE reminders ADD CONSTRAINT reminders_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE SET NULL`);
         results.push('M2c: new fkey SET NULL added ✅');
     } catch (e) { results.push('M2c skipped: ' + e.message); }
+
+    // Migration 6: expense_notes.invoice_id → collega nota alla fattura
+    try {
+        await pool.query(`ALTER TABLE expense_notes ADD COLUMN IF NOT EXISTS invoice_id INTEGER REFERENCES invoices(id) ON DELETE SET NULL`);
+        results.push('M6: expense_notes.invoice_id added ✅');
+    } catch (e) { results.push('M6 skipped: ' + e.message); }
 
     // Migration 5: expense_note_receipts table (file BLOBs)
     try {
