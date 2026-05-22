@@ -614,6 +614,9 @@ app.delete('/api/invoices/:id', authenticateToken, async (req, res) => {
 
         // Set invoice_id to NULL on reminders before deleting (preserve reminder history)
         await pool.query('UPDATE reminders SET invoice_id = NULL WHERE invoice_id = $1', [id]);
+        // Rimuovi le spese-rimborso automatiche delle note collegate e riporta le note "in sospeso"
+        await pool.query(`DELETE FROM expenses WHERE expense_note_id IN (SELECT id FROM expense_notes WHERE invoice_id = $1)`, [id]);
+        await pool.query('UPDATE expense_notes SET completed = FALSE, invoice_id = NULL WHERE invoice_id = $1', [id]);
         await pool.query('DELETE FROM invoices WHERE id = $1', [id]);
         res.json({ message: 'Fattura eliminata con successo' });
     } catch (error) {
@@ -885,12 +888,46 @@ app.put('/api/expense-notes/:id', authenticateToken, async (req, res) => {
             'UPDATE expense_notes SET description = $1, amount = $2, action_type = $3, customer_name = $4, date = $5, notes = $6, completed = $7, invoice_id = $8, updated_at = CURRENT_TIMESTAMP WHERE id = $9 RETURNING *',
             [description, amount, action_type, customer_name, date, notes, completed, invoice_id !== undefined ? invoice_id : null, id]
         );
-        res.json(result.rows[0]);
+        const note = result.rows[0];
+
+        // Sincronizza la voce di spesa automatica collegata alla nota
+        await syncReimbursementExpense(note);
+
+        res.json(note);
     } catch (error) {
         console.error('Errore update expense note:', error);
         res.status(500).json({ error: 'Errore nell\'aggiornamento nota spesa' });
     }
 });
+
+// Crea/aggiorna/elimina la voce di spesa automatica per una nota fatturata
+async function syncReimbursementExpense(note) {
+    try {
+        if (note.completed && note.action_type === 'invoice' && note.invoice_id) {
+            const invRes = await pool.query('SELECT invoice_number FROM invoices WHERE id = $1', [note.invoice_id]);
+            const invNum = invRes.rows[0] ? invRes.rows[0].invoice_number : note.invoice_id;
+            const desc = ('Spese rimborsate Fatt. #' + invNum + ' - ' + note.description).substring(0, 255);
+            const expDate = note.date || new Date();
+            const existing = await pool.query('SELECT id FROM expenses WHERE expense_note_id = $1', [note.id]);
+            if (existing.rows.length) {
+                await pool.query(
+                    'UPDATE expenses SET description = $1, amount = $2, category = $3, date = $4, updated_at = CURRENT_TIMESTAMP WHERE expense_note_id = $5',
+                    [desc, note.amount, 'Rimborso fatturato', expDate, note.id]
+                );
+            } else {
+                await pool.query(
+                    'INSERT INTO expenses (company_id, description, amount, category, date, expense_note_id) VALUES ($1, $2, $3, $4, $5, $6)',
+                    [note.company_id, desc, note.amount, 'Rimborso fatturato', expDate, note.id]
+                );
+            }
+        } else {
+            // Non più fatturata: rimuovi la spesa collegata se esiste
+            await pool.query('DELETE FROM expenses WHERE expense_note_id = $1', [note.id]);
+        }
+    } catch (e) {
+        console.error('Errore sync spesa rimborso:', e.message);
+    }
+}
 
 // Delete expense note
 app.delete('/api/expense-notes/:id', authenticateToken, async (req, res) => {
@@ -1131,6 +1168,28 @@ async function runMigrations() {
         )`);
         results.push('M4: expense_notes table created');
     } catch (e) { results.push('M4 skipped: ' + e.message); }
+
+    // Migration 7: expenses.expense_note_id → spesa automatica collegata alla nota fatturata (dopo M4/M5/M6)
+    try {
+        await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS expense_note_id INTEGER REFERENCES expense_notes(id) ON DELETE CASCADE`);
+        results.push('M7a: expenses.expense_note_id added ✅');
+    } catch (e) { results.push('M7a skipped: ' + e.message); }
+    // Backfill: crea spese per le note gia' fatturate che non ce l'hanno ancora
+    try {
+        const bf = await pool.query(`
+            INSERT INTO expenses (company_id, description, amount, category, date, expense_note_id)
+            SELECT n.company_id,
+                   LEFT('Spese rimborsate Fatt. #' || COALESCE(i.invoice_number, n.invoice_id::text) || ' - ' || n.description, 255),
+                   n.amount, 'Rimborso fatturato',
+                   COALESCE(n.date, n.created_at::date, CURRENT_DATE),
+                   n.id
+            FROM expense_notes n
+            LEFT JOIN invoices i ON n.invoice_id = i.id
+            WHERE n.completed = TRUE AND n.action_type = 'invoice' AND n.invoice_id IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM expenses e WHERE e.expense_note_id = n.id)
+            RETURNING id`);
+        results.push('M7b: backfill rimborsi -> ' + bf.rowCount + ' spese create ✅');
+    } catch (e) { results.push('M7b skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
