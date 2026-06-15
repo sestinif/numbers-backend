@@ -79,12 +79,21 @@ const apiLimiter = rateLimit({
 app.use('/api', apiLimiter);
 
 // Database connection
-// NOTA SICUREZZA: in produzione verifichiamo il certificato del DB.
-// DATABASE_CA_CERT deve contenere il certificato CA di Render (PEM) prima del deploy,
-// altrimenti la connessione rifiuterà (correttamente) un certificato non verificato.
+// NOTA SICUREZZA (TLS verso il DB):
+// - Il DB Render e' raggiunto via hostname INTERNO (rete privata Render): nessun
+//   percorso pubblico = nessun rischio MITM, quindi rejectUnauthorized:false e' accettabile.
+// - Se in futuro passi a un DB ESTERNO, imposta DATABASE_CA_CERT (PEM della CA):
+//   in quel caso il certificato viene verificato in modo stretto.
+function dbSslConfig() {
+    if (process.env.NODE_ENV !== 'production') return false;
+    if (process.env.DATABASE_CA_CERT) {
+        return { rejectUnauthorized: true, ca: process.env.DATABASE_CA_CERT };
+    }
+    return { rejectUnauthorized: false };
+}
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true, ca: process.env.DATABASE_CA_CERT } : false
+    ssl: dbSslConfig()
 });
 
 // JWT Secret - nessun fallback insicuro
