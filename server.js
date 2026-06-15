@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const sgMail = require('@sendgrid/mail');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
+const helmet = require('helmet');
 require('dotenv').config();
 
 // Multer: memory storage, 5MB max, only images/pdf
@@ -29,6 +30,14 @@ if (process.env.SENDGRID_API_KEY) {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Security headers (helmet) - applicati presto nello stack.
+// Disabilitiamo la CSP: la SPA è ospitata separatamente, quindi qui la CSP
+// riguarderebbe solo le risposte JSON dell'API e rischierebbe sorprese.
+// Restano attivi HSTS, noSniff (X-Content-Type-Options), frameguard, ecc.
+app.use(helmet({
+    contentSecurityPolicy: false
+}));
+
 // CORS - solo origini autorizzate
 const allowedOrigins = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
@@ -46,7 +55,8 @@ app.use(cors({
     credentials: true
 }));
 
-app.use(express.json());
+// Limite body JSON: 1MB (gli upload file passano da multer, non da JSON, quindi è sicuro)
+app.use(express.json({ limit: '1mb' }));
 app.use(express.static('../frontend'));
 
 // Rate limiting - protezione brute force
@@ -58,10 +68,23 @@ const authLimiter = rateLimit({
     legacyHeaders: false,
 });
 
+// Rate limiting generale su tutte le rotte /api (in aggiunta ai limiter auth più stretti)
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minuti
+    max: 300, // max 300 richieste per finestra per IP
+    message: { error: 'Troppe richieste. Riprova più tardi.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api', apiLimiter);
+
 // Database connection
+// NOTA SICUREZZA: in produzione verifichiamo il certificato del DB.
+// DATABASE_CA_CERT deve contenere il certificato CA di Render (PEM) prima del deploy,
+// altrimenti la connessione rifiuterà (correttamente) un certificato non verificato.
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true, ca: process.env.DATABASE_CA_CERT } : false
 });
 
 // JWT Secret - nessun fallback insicuro
@@ -80,7 +103,7 @@ const authenticateToken = (req, res, next) => {
         return res.status(401).json({ error: 'Token mancante' });
     }
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
+    jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }, (err, user) => {
         if (err) {
             return res.status(403).json({ error: 'Token non valido' });
         }
@@ -556,6 +579,17 @@ app.post('/api/companies/:companyId/invoices', authenticateToken, async (req, re
             return res.status(404).json({ error: 'Azienda non trovata' });
         }
 
+        // Verifica cross-tenant: il cliente deve appartenere a un'azienda dell'utente
+        if (customer_id) {
+            const custCheck = await pool.query(
+                'SELECT cu.id FROM customers cu JOIN companies co ON cu.company_id = co.id WHERE cu.id = $1 AND co.user_id = $2',
+                [customer_id, req.user.id]
+            );
+            if (custCheck.rows.length === 0) {
+                return res.status(403).json({ error: 'Cliente non valido' });
+            }
+        }
+
         const result = await pool.query(
             'INSERT INTO invoices (company_id, customer_id, invoice_number, date, due_date, items, subtotal, tax, total, status, notes, currency) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *',
             [companyId, customer_id, invoice_number, date, due_date, JSON.stringify(items), subtotal, tax, total, status, notes, currency || 'EUR']
@@ -767,6 +801,17 @@ app.post('/api/companies/:companyId/reminders', authenticateToken, async (req, r
             return res.status(404).json({ error: 'Azienda non trovata' });
         }
 
+        // Verifica cross-tenant: la fattura collegata deve appartenere all'utente
+        if (invoice_id) {
+            const invCheck = await pool.query(
+                'SELECT i.id FROM invoices i JOIN companies co ON i.company_id = co.id WHERE i.id = $1 AND co.user_id = $2',
+                [invoice_id, req.user.id]
+            );
+            if (invCheck.rows.length === 0) {
+                return res.status(403).json({ error: 'Fattura non valida' });
+            }
+        }
+
         const result = await pool.query(
             'INSERT INTO reminders (company_id, invoice_id, title, description, due_date, completed) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
             [companyId, invoice_id, title, description, due_date, completed || false]
@@ -884,6 +929,16 @@ app.put('/api/expense-notes/:id', authenticateToken, async (req, res) => {
         if (check.rows.length === 0) {
             return res.status(404).json({ error: 'Nota spesa non trovata' });
         }
+        // Verifica cross-tenant: la fattura collegata deve appartenere all'utente
+        if (invoice_id) {
+            const invCheck = await pool.query(
+                'SELECT i.id FROM invoices i JOIN companies co ON i.company_id = co.id WHERE i.id = $1 AND co.user_id = $2',
+                [invoice_id, req.user.id]
+            );
+            if (invCheck.rows.length === 0) {
+                return res.status(403).json({ error: 'Fattura non valida' });
+            }
+        }
         const result = await pool.query(
             'UPDATE expense_notes SET description = $1, amount = $2, action_type = $3, customer_name = $4, date = $5, notes = $6, completed = $7, invoice_id = $8, updated_at = CURRENT_TIMESTAMP WHERE id = $9 RETURNING *',
             [description, amount, action_type, customer_name, date, notes, completed, invoice_id !== undefined ? invoice_id : null, id]
@@ -904,7 +959,8 @@ app.put('/api/expense-notes/:id', authenticateToken, async (req, res) => {
 async function syncReimbursementExpense(note) {
     try {
         if (note.completed && note.action_type === 'invoice' && note.invoice_id) {
-            const invRes = await pool.query('SELECT invoice_number FROM invoices WHERE id = $1', [note.invoice_id]);
+            // Scope alla company della nota: evita di leggere il numero fattura di un altro tenant
+            const invRes = await pool.query('SELECT invoice_number FROM invoices WHERE id = $1 AND company_id = $2', [note.invoice_id, note.company_id]);
             const invNum = invRes.rows[0] ? invRes.rows[0].invoice_number : note.invoice_id;
             const desc = ('Spese rimborsate Fatt. #' + invNum + ' - ' + note.description).substring(0, 255);
             const expDate = note.date || new Date();
@@ -1047,8 +1103,11 @@ app.get('/api/receipts/:receiptId', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Ricevuta non trovata' });
         }
         const row = r.rows[0];
+        // Download sicuro: forziamo attachment (non inline) e nosniff per evitare
+        // che il browser interpreti/esegua il contenuto del file caricato.
         res.setHeader('Content-Type', row.mime_type);
-        res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(row.filename)}"`);
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(row.filename)}"`);
         res.send(row.file_data);
     } catch (error) {
         console.error('Errore download receipt:', error);
@@ -1195,8 +1254,15 @@ async function runMigrations() {
     return results;
 }
 
-// Manual migration endpoint (protetto, solo con autenticazione)
+// Manual migration endpoint (protetto: richiede autenticazione + segreto in header).
+// Se MIGRATE_SECRET non è configurato, l'endpoint è disabilitato (404).
 app.get('/api/migrate', authenticateToken, async (req, res) => {
+    if (!process.env.MIGRATE_SECRET) {
+        return res.status(404).json({ error: 'Not found' });
+    }
+    if (req.headers['x-migrate-secret'] !== process.env.MIGRATE_SECRET) {
+        return res.status(403).json({ error: 'Non autorizzato' });
+    }
     const results = await runMigrations();
     res.json({ results });
 });
