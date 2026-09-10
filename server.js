@@ -10,6 +10,7 @@ const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const helmet = require('helmet');
 require('dotenv').config();
+const aiCosts = require('./ai-costs');
 
 // Multer: memory storage, 5MB max, only images/pdf
 const receiptUpload = multer({
@@ -676,10 +677,13 @@ app.get('/api/companies/:companyId/expenses', authenticateToken, async (req, res
 
     try {
         // Check ownership
-        const check = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
+        const check = await pool.query('SELECT id, name FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
         if (check.rows.length === 0) {
             return res.status(404).json({ error: 'Azienda non trovata' });
         }
+
+        // Aggiorna le voci automatiche delle spese API (OpenAI/Gemini), al massimo una volta l'ora
+        await aiCosts.syncIfStale(pool, check.rows[0]);
 
         const result = await pool.query(
             'SELECT * FROM expenses WHERE company_id = $1 ORDER BY date DESC',
@@ -1258,6 +1262,15 @@ async function runMigrations() {
             RETURNING id`);
         results.push('M7b: backfill rimborsi -> ' + bf.rowCount + ' spese create ✅');
     } catch (e) { results.push('M7b skipped: ' + e.message); }
+
+    // Migration 8: voci di spesa automatiche (costi API OpenAI/Gemini), una per fornitore per mese
+    try {
+        await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS auto_source VARCHAR(50)`);
+        await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS auto_period VARCHAR(7)`);
+        await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_expenses_auto
+            ON expenses(company_id, auto_source, auto_period) WHERE auto_source IS NOT NULL`);
+        results.push('M8: expenses.auto_source/auto_period added ✅');
+    } catch (e) { results.push('M8 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
