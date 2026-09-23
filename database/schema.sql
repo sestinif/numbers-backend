@@ -99,3 +99,20 @@ CREATE INDEX idx_reminders_company_id ON reminders(company_id);
 CREATE INDEX idx_reminders_invoice_id ON reminders(invoice_id);
 CREATE INDEX idx_invoices_date ON invoices(date);
 CREATE INDEX idx_expenses_date ON expenses(date);
+
+-- Notes table (promemoria con testo lungo e alert in-app)
+CREATE TABLE notes (
+    id SERIAL PRIMARY KEY,
+    company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    body TEXT,
+    due_date DATE NOT NULL,
+    done BOOLEAN DEFAULT FALSE,
+    done_at TIMESTAMP,
+    snoozed_until DATE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_notes_company_id ON notes(company_id);
+CREATE INDEX idx_notes_due_date ON notes(due_date);

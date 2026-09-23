@@ -884,6 +884,143 @@ app.delete('/api/reminders/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// ============= NOTES ROUTES =============
+
+// Le colonne DATE escono come testo: il driver pg le convertirebbe in Date a
+// mezzanotte locale, che serializzata in UTC puo' risultare il giorno prima.
+const NOTE_COLUMNS = `id, company_id, title, body,
+    TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date,
+    done, done_at,
+    TO_CHAR(snoozed_until, 'YYYY-MM-DD') AS snoozed_until,
+    created_at, updated_at`;
+
+// Get all notes for company
+app.get('/api/companies/:companyId/notes', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+
+    try {
+        const check = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Azienda non trovata' });
+        }
+
+        const result = await pool.query(
+            `SELECT ${NOTE_COLUMNS} FROM notes WHERE company_id = $1 ORDER BY due_date ASC`,
+            [companyId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Errore get notes:', error);
+        res.status(500).json({ error: 'Errore nel recupero note' });
+    }
+});
+
+// Create note
+app.post('/api/companies/:companyId/notes', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    const { title, body, due_date } = req.body;
+
+    if (!title || !String(title).trim()) {
+        return res.status(400).json({ error: 'Il titolo e\' obbligatorio' });
+    }
+    if (!due_date || !/^\d{4}-\d{2}-\d{2}$/.test(String(due_date))) {
+        return res.status(400).json({ error: 'Data di scadenza non valida' });
+    }
+
+    try {
+        const check = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Azienda non trovata' });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO notes (company_id, title, body, due_date)
+             VALUES ($1, $2, $3, $4) RETURNING ${NOTE_COLUMNS}`,
+            [companyId, String(title).trim().slice(0, 255), body || null, due_date]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Errore create note:', error);
+        res.status(500).json({ error: 'Errore nella creazione nota' });
+    }
+});
+
+// Update note (modifica, "Fatto", rinvio)
+app.put('/api/notes/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { title, body, due_date, done, snoozed_until } = req.body;
+
+    try {
+        const check = await pool.query(
+            'SELECT n.id FROM notes n JOIN companies co ON n.company_id = co.id WHERE n.id = $1 AND co.user_id = $2',
+            [id, req.user.id]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Nota non trovata' });
+        }
+
+        if (title !== undefined && !String(title).trim()) {
+            return res.status(400).json({ error: 'Il titolo e\' obbligatorio' });
+        }
+        if (due_date !== undefined && due_date !== null && !/^\d{4}-\d{2}-\d{2}$/.test(String(due_date))) {
+            return res.status(400).json({ error: 'Data di scadenza non valida' });
+        }
+        if (snoozed_until !== undefined && snoozed_until !== null && !/^\d{4}-\d{2}-\d{2}$/.test(String(snoozed_until))) {
+            return res.status(400).json({ error: 'Data di rinvio non valida' });
+        }
+
+        // COALESCE: i campi non inviati restano com'erano.
+        // done_at segue done: si valorizza quando si chiude, si azzera quando si riapre.
+        const result = await pool.query(
+            `UPDATE notes SET
+                title = COALESCE($1, title),
+                body = COALESCE($2, body),
+                due_date = COALESCE($3::date, due_date),
+                done = COALESCE($4, done),
+                done_at = CASE
+                    WHEN $4 IS TRUE AND done IS NOT TRUE THEN CURRENT_TIMESTAMP
+                    WHEN $4 IS FALSE THEN NULL
+                    ELSE done_at END,
+                snoozed_until = CASE WHEN $5::text = '' THEN NULL ELSE COALESCE($5::text::date, snoozed_until) END,
+                updated_at = CURRENT_TIMESTAMP
+             WHERE id = $6 RETURNING ${NOTE_COLUMNS}`,
+            [
+                title !== undefined ? String(title).trim().slice(0, 255) : null,
+                body !== undefined ? body : null,
+                due_date !== undefined ? due_date : null,
+                done !== undefined ? done : null,
+                snoozed_until === null ? '' : (snoozed_until !== undefined ? snoozed_until : null),
+                id
+            ]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Errore update note:', error);
+        res.status(500).json({ error: 'Errore nell\'aggiornamento nota' });
+    }
+});
+
+// Delete note
+app.delete('/api/notes/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const check = await pool.query(
+            'SELECT n.id FROM notes n JOIN companies co ON n.company_id = co.id WHERE n.id = $1 AND co.user_id = $2',
+            [id, req.user.id]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Nota non trovata' });
+        }
+
+        await pool.query('DELETE FROM notes WHERE id = $1', [id]);
+        res.json({ message: 'Nota eliminata con successo' });
+    } catch (error) {
+        console.error('Errore delete note:', error);
+        res.status(500).json({ error: 'Errore nell\'eliminazione nota' });
+    }
+});
+
 // ============= EXPENSE NOTES (RIMBORSI) ROUTES =============
 
 // Get all expense notes for company
@@ -1271,6 +1408,25 @@ async function runMigrations() {
             ON expenses(company_id, auto_source, auto_period) WHERE auto_source IS NOT NULL`);
         results.push('M8: expenses.auto_source/auto_period added ✅');
     } catch (e) { results.push('M8 skipped: ' + e.message); }
+
+    // Migration 9: tabella notes (promemoria con testo lungo e alert in-app)
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS notes (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            title VARCHAR(255) NOT NULL,
+            body TEXT,
+            due_date DATE NOT NULL,
+            done BOOLEAN DEFAULT FALSE,
+            done_at TIMESTAMP,
+            snoozed_until DATE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_notes_company_id ON notes(company_id)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_notes_due_date ON notes(due_date)`);
+        results.push('M9: tabella notes creata ✅');
+    } catch (e) { results.push('M9 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
