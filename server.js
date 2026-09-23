@@ -778,6 +778,12 @@ app.delete('/api/expenses/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// Ricorrenze ammesse per le scadenze. Qualsiasi altra cosa arrivi ripiega su 'once'.
+const RECURRENCES = ['once', 'weekly', 'monthly', 'yearly'];
+function normalizeRecurrence(value) {
+    return RECURRENCES.includes(value) ? value : 'once';
+}
+
 // ============= REMINDERS ROUTES =============
 
 // Get all reminders for company
@@ -792,7 +798,11 @@ app.get('/api/companies/:companyId/reminders', authenticateToken, async (req, re
         }
 
         const result = await pool.query(
-            'SELECT * FROM reminders WHERE company_id = $1 ORDER BY due_date ASC',
+            `SELECT id, company_id, invoice_id, title, description,
+                    TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date,
+                    COALESCE(recurrence, 'once') AS recurrence,
+                    completed, created_at, updated_at
+             FROM reminders WHERE company_id = $1 ORDER BY due_date ASC`,
             [companyId]
         );
         res.json(result.rows);
@@ -805,7 +815,7 @@ app.get('/api/companies/:companyId/reminders', authenticateToken, async (req, re
 // Create reminder
 app.post('/api/companies/:companyId/reminders', authenticateToken, async (req, res) => {
     const { companyId } = req.params;
-    const { invoice_id, title, description, due_date, completed } = req.body;
+    const { invoice_id, title, description, due_date, completed, recurrence } = req.body;
 
     try {
         // Check ownership
@@ -826,8 +836,9 @@ app.post('/api/companies/:companyId/reminders', authenticateToken, async (req, r
         }
 
         const result = await pool.query(
-            'INSERT INTO reminders (company_id, invoice_id, title, description, due_date, completed) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-            [companyId, invoice_id, title, description, due_date, completed || false]
+            `INSERT INTO reminders (company_id, invoice_id, title, description, due_date, completed, recurrence)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+            [companyId, invoice_id, title, description, due_date, completed || false, normalizeRecurrence(recurrence)]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -839,7 +850,7 @@ app.post('/api/companies/:companyId/reminders', authenticateToken, async (req, r
 // Update reminder
 app.put('/api/reminders/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
-    const { title, description, due_date, completed } = req.body;
+    const { title, description, due_date, completed, recurrence } = req.body;
 
     try {
         // Check ownership
@@ -852,8 +863,22 @@ app.put('/api/reminders/:id', authenticateToken, async (req, res) => {
         }
 
         const result = await pool.query(
-            'UPDATE reminders SET title = $1, description = $2, due_date = $3, completed = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $5 RETURNING *',
-            [title, description, due_date, completed, id]
+            `UPDATE reminders SET
+                title = COALESCE($1, title),
+                description = COALESCE($2, description),
+                due_date = COALESCE($3::date, due_date),
+                completed = COALESCE($4, completed),
+                recurrence = COALESCE($5, recurrence),
+                updated_at = CURRENT_TIMESTAMP
+             WHERE id = $6 RETURNING *`,
+            [
+                title !== undefined ? title : null,
+                description !== undefined ? description : null,
+                due_date !== undefined ? due_date : null,
+                completed !== undefined ? completed : null,
+                recurrence !== undefined ? normalizeRecurrence(recurrence) : null,
+                id
+            ]
         );
         res.json(result.rows[0]);
     } catch (error) {
@@ -1427,6 +1452,13 @@ async function runMigrations() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_notes_due_date ON notes(due_date)`);
         results.push('M9: tabella notes creata ✅');
     } catch (e) { results.push('M9 skipped: ' + e.message); }
+
+    // Migration 10: reminders.recurrence — il form la inviava da sempre ma non veniva salvata
+    try {
+        await pool.query(`ALTER TABLE reminders ADD COLUMN IF NOT EXISTS recurrence VARCHAR(20) DEFAULT 'once'`);
+        await pool.query(`UPDATE reminders SET recurrence = 'once' WHERE recurrence IS NULL`);
+        results.push('M10: reminders.recurrence aggiunta ✅');
+    } catch (e) { results.push('M10 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
