@@ -6,6 +6,7 @@
 // - OPENAI_ADMIN_KEY      Admin key OpenAI (sk-admin-...), serve per /v1/organization/costs
 // - GCP_BILLING_SA_KEY    JSON del service account Google con accesso in lettura a BigQuery
 // - GCP_BILLING_TABLE     tabella dell'export fatturazione: progetto.dataset.gcp_billing_export_v1_XXXX
+// - APIFY_TOKEN           token API Apify (apify_api_...), per leggere l'uso mensile
 // - AI_COSTS_COMPANY_ID   (opzionale) id azienda; se assente usa l'azienda "Scaling Catalyst"
 // Se le chiavi di un fornitore mancano, quel fornitore viene semplicemente saltato.
 
@@ -95,9 +96,57 @@ async function geminiCosts(fromDate) {
     return rows.map(r => ({ period: r.period, amount: Number(r.amount), currency: r.currency.toUpperCase() }));
 }
 
+// Apify fattura a cicli (es. 13→12), non a mese solare. L'endpoint monthly dà
+// il dettaglio giornaliero del ciclo che contiene una certa data: interroghiamo i
+// cicli che coprono da fromDate a oggi e ricuciamo i costi giornalieri per mese solare.
+async function apifyCosts(fromDate) {
+    const token = process.env.APIFY_TOKEN;
+    if (!token) return null;
+
+    const now = new Date();
+    // Date-campione per coprire ogni ciclo tra fromDate e oggi: 1° mese scorso, 1° mese corrente, oggi
+    const sampleDates = [
+        fromDate,
+        new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
+        now
+    ];
+
+    const seenCycle = new Set();
+    const totals = {};
+    for (const d of sampleDates) {
+        const url = `https://api.apify.com/v2/users/me/usage/monthly?date=${isoDay(d)}`;
+        const res = await fetch(url, {
+            headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(8000)
+        });
+        if (!res.ok) throw new Error(`Apify usage HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+        const body = (await res.json()).data || {};
+        const cycleKey = body.usageCycle?.startAt;
+        if (cycleKey && seenCycle.has(cycleKey)) continue; // stesso ciclo già contato
+        if (cycleKey) seenCycle.add(cycleKey);
+
+        for (const day of body.dailyServiceUsages || []) {
+            if (new Date(day.date) < fromDate) continue; // fuori dalla finestra
+            const period = day.date.slice(0, 7); // 'YYYY-MM'
+            let dayUsd = 0;
+            for (const svc of Object.values(day.serviceUsage || {})) {
+                dayUsd += Number(svc.baseAmountUsd || 0);
+            }
+            totals[period] = (totals[period] || 0) + dayUsd;
+        }
+    }
+
+    return Object.entries(totals).map(([period, amount]) => ({
+        period,
+        amount: Math.round(amount * 1e6) / 1e6,
+        currency: 'USD'
+    }));
+}
+
 const PROVIDERS = [
     { source: 'openai', label: 'OpenAI', fetch: openaiCosts },
-    { source: 'gemini', label: 'Gemini', fetch: geminiCosts }
+    { source: 'gemini', label: 'Gemini', fetch: geminiCosts },
+    { source: 'apify', label: 'Apify', fetch: apifyCosts }
 ];
 
 // ===== CAMBIO (BCE via Frankfurter) =====
