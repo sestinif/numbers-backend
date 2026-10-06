@@ -11,6 +11,7 @@ const multer = require('multer');
 const helmet = require('helmet');
 require('dotenv').config();
 const aiCosts = require('./ai-costs');
+const recurring = require('./recurring');
 
 // Multer: memory storage, 5MB max, only images/pdf
 const receiptUpload = multer({
@@ -684,6 +685,9 @@ app.get('/api/companies/:companyId/expenses', authenticateToken, async (req, res
 
         // Aggiorna le voci automatiche delle spese API (OpenAI/Gemini), al massimo una volta l'ora
         await aiCosts.syncIfStale(pool, check.rows[0]);
+        // Materializza le spese ricorrenti attive (crea le righe dei mesi mancanti)
+        try { await recurring.materialize(pool, companyId); }
+        catch (e) { console.error('Errore materializzazione ricorrenti:', e.message); }
 
         const result = await pool.query(
             'SELECT * FROM expenses WHERE company_id = $1 ORDER BY date DESC',
@@ -775,6 +779,135 @@ app.delete('/api/expenses/:id', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Errore delete expense:', error);
         res.status(500).json({ error: 'Errore nell\'eliminazione spesa' });
+    }
+});
+
+// ============= SPESE RICORRENTI (regole) =============
+
+const PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+// Controlla che la regola appartenga a un'azienda dell'utente. Ritorna la riga o null.
+async function ownRecurringRule(ruleId, userId) {
+    const r = await pool.query(
+        `SELECT rr.* FROM recurring_rules rr JOIN companies co ON rr.company_id = co.id
+         WHERE rr.id = $1 AND co.user_id = $2`,
+        [ruleId, userId]
+    );
+    return r.rows[0] || null;
+}
+
+// Lista regole di un'azienda
+app.get('/api/companies/:companyId/recurring', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        const check = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
+        if (check.rows.length === 0) return res.status(404).json({ error: 'Azienda non trovata' });
+        const result = await pool.query(
+            'SELECT * FROM recurring_rules WHERE company_id = $1 ORDER BY active DESC, name',
+            [companyId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Errore get ricorrenti:', error);
+        res.status(500).json({ error: 'Errore nel recupero delle ricorrenti' });
+    }
+});
+
+// Crea una regola ricorrente
+app.post('/api/companies/:companyId/recurring', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    const { name, amount, category, frequency, day_of_month, start_period, end_period } = req.body;
+
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Il nome è obbligatorio' });
+    if (isNaN(parseFloat(amount)) || parseFloat(amount) < 0) return res.status(400).json({ error: 'L\'importo deve essere un numero valido' });
+    const freq = frequency === 'yearly' ? 'yearly' : 'monthly';
+    const day = Math.min(Math.max(parseInt(day_of_month) || 1, 1), 31);
+    const start = PERIOD_RE.test(start_period) ? start_period : recurring.currentPeriod();
+    const end = end_period && PERIOD_RE.test(end_period) ? end_period : null;
+    if (end && end < start) return res.status(400).json({ error: 'La fine non può precedere l\'inizio' });
+
+    try {
+        const check = await pool.query('SELECT id, name FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
+        if (check.rows.length === 0) return res.status(404).json({ error: 'Azienda non trovata' });
+
+        const result = await pool.query(
+            `INSERT INTO recurring_rules (company_id, name, amount, category, frequency, day_of_month, start_period, end_period)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+            [companyId, name.trim(), amount, category || null, freq, day, start, end]
+        );
+        // Materializza subito le voci dei mesi già dovuti, così compaiono senza aspettare
+        try { await recurring.materialize(pool, companyId); } catch (e) { console.error('Materializzazione post-create:', e.message); }
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Errore create ricorrente:', error);
+        res.status(500).json({ error: 'Errore nella creazione della regola' });
+    }
+});
+
+// Modifica una regola (nome/importo/categoria/giorno/frequenza/fine).
+// Nota: i mesi già materializzati NON cambiano (storico vero); vale solo per i mesi nuovi.
+app.put('/api/recurring/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const rule = await ownRecurringRule(id, req.user.id);
+        if (!rule) return res.status(404).json({ error: 'Regola non trovata' });
+
+        const name = req.body.name != null && req.body.name.trim() ? req.body.name.trim() : rule.name;
+        const amount = !isNaN(parseFloat(req.body.amount)) && parseFloat(req.body.amount) >= 0 ? req.body.amount : rule.amount;
+        const category = req.body.category !== undefined ? (req.body.category || null) : rule.category;
+        const frequency = req.body.frequency === 'yearly' ? 'yearly' : (req.body.frequency === 'monthly' ? 'monthly' : rule.frequency);
+        const day = req.body.day_of_month != null ? Math.min(Math.max(parseInt(req.body.day_of_month) || 1, 1), 31) : rule.day_of_month;
+        let end = rule.end_period;
+        if (req.body.end_period !== undefined) {
+            end = req.body.end_period && PERIOD_RE.test(req.body.end_period) ? req.body.end_period : null;
+            if (end && end < rule.start_period) return res.status(400).json({ error: 'La fine non può precedere l\'inizio' });
+        }
+
+        const result = await pool.query(
+            `UPDATE recurring_rules SET name=$1, amount=$2, category=$3, frequency=$4, day_of_month=$5, end_period=$6, updated_at=CURRENT_TIMESTAMP
+             WHERE id=$7 RETURNING *`,
+            [name, amount, category, frequency, day, end, id]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Errore update ricorrente:', error);
+        res.status(500).json({ error: 'Errore nell\'aggiornamento della regola' });
+    }
+});
+
+// Interrompi una regola: mette la fine (default: mese corrente). Lo storico resta.
+app.post('/api/recurring/:id/stop', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const rule = await ownRecurringRule(id, req.user.id);
+        if (!rule) return res.status(404).json({ error: 'Regola non trovata' });
+        const period = PERIOD_RE.test(req.body?.period) ? req.body.period : recurring.currentPeriod();
+        const end = period < rule.start_period ? rule.start_period : period;
+        const result = await pool.query(
+            `UPDATE recurring_rules SET end_period=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2 RETURNING *`,
+            [end, id]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Errore stop ricorrente:', error);
+        res.status(500).json({ error: 'Errore nell\'interruzione della regola' });
+    }
+});
+
+// Elimina una regola. Di default lo storico resta; con ?withHistory=true toglie anche le voci generate.
+app.delete('/api/recurring/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const rule = await ownRecurringRule(id, req.user.id);
+        if (!rule) return res.status(404).json({ error: 'Regola non trovata' });
+        if (req.query.withHistory === 'true') {
+            await pool.query(`DELETE FROM expenses WHERE company_id = $1 AND auto_source = $2`, [rule.company_id, `rule:${id}`]);
+        }
+        await pool.query('DELETE FROM recurring_rules WHERE id = $1', [id]);
+        res.json({ message: 'Regola eliminata', historyRemoved: req.query.withHistory === 'true' });
+    } catch (error) {
+        console.error('Errore delete ricorrente:', error);
+        res.status(500).json({ error: 'Errore nell\'eliminazione della regola' });
     }
 });
 
@@ -1459,6 +1592,26 @@ async function runMigrations() {
         await pool.query(`UPDATE reminders SET recurrence = 'once' WHERE recurrence IS NULL`);
         results.push('M10: reminders.recurrence aggiunta ✅');
     } catch (e) { results.push('M10 skipped: ' + e.message); }
+
+    // Migration 11: regole delle spese ricorrenti (abbonamenti/tool business)
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS recurring_rules (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            name VARCHAR(255) NOT NULL,
+            amount DECIMAL(10, 2) NOT NULL,
+            category VARCHAR(100),
+            frequency VARCHAR(20) DEFAULT 'monthly',
+            day_of_month INTEGER DEFAULT 1,
+            start_period VARCHAR(7) NOT NULL,
+            end_period VARCHAR(7),
+            active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_recurring_company ON recurring_rules(company_id)`);
+        results.push('M11: recurring_rules creata ✅');
+    } catch (e) { results.push('M11 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
