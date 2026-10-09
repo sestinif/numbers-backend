@@ -704,6 +704,7 @@ app.get('/api/companies/:companyId/expenses', authenticateToken, async (req, res
 app.post('/api/companies/:companyId/expenses', authenticateToken, async (req, res) => {
     const { companyId } = req.params;
     const { description, amount, category, date, notes } = req.body;
+    const account = recurring.cleanAccount(req.body.account);
 
     if (!description || !description.trim()) {
         return res.status(400).json({ error: 'La descrizione è obbligatoria' });
@@ -720,8 +721,8 @@ app.post('/api/companies/:companyId/expenses', authenticateToken, async (req, re
         }
 
         const result = await pool.query(
-            'INSERT INTO expenses (company_id, description, amount, category, date, notes) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-            [companyId, description, amount, category, date, notes]
+            'INSERT INTO expenses (company_id, description, amount, category, date, notes, account) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+            [companyId, description, amount, category, date, notes, account]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -749,11 +750,21 @@ app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Spesa non trovata' });
         }
 
-        const result = await pool.query(
-            'UPDATE expenses SET description = $1, amount = $2, category = $3, date = $4, notes = $5, updated_at = CURRENT_TIMESTAMP WHERE id = $6 RETURNING *',
-            [description, amount, category, date, notes, id]
-        );
-        res.json(result.rows[0]);
+        // Il conto cambia solo se la richiesta lo porta: una pagina vecchia che non lo manda non lo cancella.
+        const result = req.body.account !== undefined
+            ? await pool.query(
+                'UPDATE expenses SET description = $1, amount = $2, category = $3, date = $4, notes = $5, account = $6, updated_at = CURRENT_TIMESTAMP WHERE id = $7 RETURNING *',
+                [description, amount, category, date, notes, recurring.cleanAccount(req.body.account), id])
+            : await pool.query(
+                'UPDATE expenses SET description = $1, amount = $2, category = $3, date = $4, notes = $5, updated_at = CURRENT_TIMESTAMP WHERE id = $6 RETURNING *',
+                [description, amount, category, date, notes, id]);
+        let saved = result.rows[0];
+        // Voce di una regola variabile: salvarla vuol dire confermare la cifra del mese.
+        try {
+            const done = await recurring.afterExpenseSaved(pool, saved);
+            if (done.confirmed) saved = Object.assign({}, saved, { amount_confirmed: true });
+        } catch (e) { console.error('Errore conferma voce variabile:', e.message); }
+        res.json(saved);
     } catch (error) {
         console.error('Errore update expense:', error);
         res.status(500).json({ error: 'Errore nell\'aggiornamento spesa' });
@@ -825,15 +836,17 @@ app.post('/api/companies/:companyId/recurring', authenticateToken, async (req, r
     const start = PERIOD_RE.test(start_period) ? start_period : recurring.currentPeriod();
     const end = end_period && PERIOD_RE.test(end_period) ? end_period : null;
     if (end && end < start) return res.status(400).json({ error: 'La fine non può precedere l\'inizio' });
+    const account = recurring.cleanAccount(req.body.account);
+    const costType = recurring.normalizeCostType(req.body.cost_type);
 
     try {
         const check = await pool.query('SELECT id, name FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
         if (check.rows.length === 0) return res.status(404).json({ error: 'Azienda non trovata' });
 
         const result = await pool.query(
-            `INSERT INTO recurring_rules (company_id, name, amount, category, frequency, day_of_month, start_period, end_period)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-            [companyId, name.trim(), amount, category || null, freq, day, start, end]
+            `INSERT INTO recurring_rules (company_id, name, amount, category, frequency, day_of_month, start_period, end_period, account, cost_type)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+            [companyId, name.trim(), amount, category || null, freq, day, start, end, account, costType]
         );
         // Materializza subito le voci dei mesi già dovuti, così compaiono senza aspettare
         try { await recurring.materialize(pool, companyId); } catch (e) { console.error('Materializzazione post-create:', e.message); }
@@ -863,10 +876,15 @@ app.put('/api/recurring/:id', authenticateToken, async (req, res) => {
             if (end && end < rule.start_period) return res.status(400).json({ error: 'La fine non può precedere l\'inizio' });
         }
 
+        // Conto e tipo cambiano solo se la richiesta li porta. Valgono per i mesi nuovi, come l'importo.
+        const account = req.body.account !== undefined ? recurring.cleanAccount(req.body.account) : (rule.account || null);
+        const costType = recurring.normalizeCostType(req.body.cost_type, recurring.normalizeCostType(rule.cost_type));
+
         const result = await pool.query(
-            `UPDATE recurring_rules SET name=$1, amount=$2, category=$3, frequency=$4, day_of_month=$5, end_period=$6, updated_at=CURRENT_TIMESTAMP
-             WHERE id=$7 RETURNING *`,
-            [name, amount, category, frequency, day, end, id]
+            `UPDATE recurring_rules SET name=$1, amount=$2, category=$3, frequency=$4, day_of_month=$5, end_period=$6,
+                    account=$7, cost_type=$8, updated_at=CURRENT_TIMESTAMP
+             WHERE id=$9 RETURNING *`,
+            [name, amount, category, frequency, day, end, account, costType, id]
         );
         res.json(result.rows[0]);
     } catch (error) {
@@ -1612,6 +1630,17 @@ async function runMigrations() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_recurring_company ON recurring_rules(company_id)`);
         results.push('M11: recurring_rules creata ✅');
     } catch (e) { results.push('M11 skipped: ' + e.message); }
+
+    // Migration 12: conto di addebito e tipo (fisso/variabile) su regole e spese.
+    // Solo colonne in più: le righe esistenti restano come sono (regole = fisse, spese = confermate).
+    try {
+        await pool.query(`ALTER TABLE recurring_rules ADD COLUMN IF NOT EXISTS account VARCHAR(120)`);
+        await pool.query(`ALTER TABLE recurring_rules ADD COLUMN IF NOT EXISTS cost_type VARCHAR(10) NOT NULL DEFAULT 'fixed'`);
+        await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS account VARCHAR(120)`);
+        await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cost_type VARCHAR(10)`);
+        await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS amount_confirmed BOOLEAN NOT NULL DEFAULT TRUE`);
+        results.push('M12: conto e tipo su regole e spese ✅');
+    } catch (e) { results.push('M12 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
