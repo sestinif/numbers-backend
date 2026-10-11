@@ -169,7 +169,13 @@ app.post('/api/auth/code', codeLimiter, async (req, res) => {
         res.json({ user: { id: user.id, email: user.email, name: user.name }, token });
     } catch (error) {
         console.error('Errore accesso con codice:', error.message);
-        res.status(500).json({ error: 'Accesso non configurato bene sul server' });
+        // Qui si arriva solo con il codice giusto: si può dire cosa manca.
+        const missingOwner = /NUMBERS_OWNER_EMAIL/.test(error.message);
+        res.status(500).json({
+            error: missingOwner
+                ? 'Il codice è giusto, ma il server non sa in quale utente farti entrare: su Render aggiungi NUMBERS_OWNER_EMAIL con la tua email di Numbers.'
+                : 'Accesso non riuscito per un errore del server'
+        });
     }
 });
 

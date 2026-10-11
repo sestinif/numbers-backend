@@ -57,11 +57,26 @@ function tokenStillValid(payload, env) {
     return !!payload && payload.cv === version(env);
 }
 
+// Le grafie con cui la stessa casella può essere salvata: com'è scritta, e come la riduceva il vecchio accesso.
+function emailVariants(email) {
+    const lower = String(email).trim().toLowerCase();
+    const at = lower.lastIndexOf('@');
+    if (at < 1) return [lower];
+    const local = lower.slice(0, at), domain = lower.slice(at + 1);
+    const out = new Set([lower]);
+    if (domain === 'gmail.com' || domain === 'googlemail.com') {
+        out.add(local.split('+')[0].replace(/\./g, '') + '@gmail.com');
+    }
+    return Array.from(out);
+}
+
 async function resolveOwner(pool, env) {
     const wanted = env && typeof env.NUMBERS_OWNER_EMAIL === 'string' ? env.NUMBERS_OWNER_EMAIL.trim().toLowerCase() : '';
     if (wanted) {
-        const r = await pool.query('SELECT id, email, name FROM users WHERE email = $1', [wanted]);
-        if (r.rows.length !== 1) throw new Error('NUMBERS_OWNER_EMAIL non corrisponde a nessun utente');
+        // Il vecchio accesso salvava le email «normalizzate»: per Gmail senza i punti e senza il +etichetta.
+        // Si cercano tutte e due le grafie, così va bene comunque Federico la scriva.
+        const r = await pool.query('SELECT id, email, name FROM users WHERE lower(email) = ANY($1) ORDER BY id LIMIT 2', [emailVariants(wanted)]);
+        if (r.rows.length !== 1) throw new Error('NUMBERS_OWNER_EMAIL non corrisponde a un utente solo');
         return r.rows[0];
     }
     const r = await pool.query(
@@ -74,4 +89,4 @@ async function resolveOwner(pool, env) {
     return r.rows[0];
 }
 
-module.exports = { MIN_LENGTH, isEnabled, isStrong, matches, version, tokenStillValid, resolveOwner };
+module.exports = { MIN_LENGTH, isEnabled, isStrong, matches, version, tokenStillValid, resolveOwner, emailVariants };

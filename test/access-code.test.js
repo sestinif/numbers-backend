@@ -56,7 +56,7 @@ test('un gettone resta valido solo finché il codice è lo stesso', () => {
 
 test('il proprietario è quello indicato, o l\'unico utente che ha un\'azienda', async () => {
     const pool = (rowsByQuery) => ({ query: async (sql, params) => ({ rows: rowsByQuery(sql, params) }) });
-    const byEmail = pool((sql, params) => /WHERE email/.test(sql) ? (params[0] === 'fede@example.com' ? [{ id: 7, email: 'fede@example.com', name: 'Fede' }] : []) : []);
+    const byEmail = pool((sql, params) => /lower\(email\) = ANY/.test(sql) ? (params[0].includes('fede@example.com') ? [{ id: 7, email: 'fede@example.com', name: 'Fede' }] : []) : []);
     assert.deepStrictEqual(await access.resolveOwner(byEmail, { NUMBERS_OWNER_EMAIL: ' Fede@Example.com ' }), { id: 7, email: 'fede@example.com', name: 'Fede' });
     await assert.rejects(() => access.resolveOwner(byEmail, { NUMBERS_OWNER_EMAIL: 'altro@example.com' }), /NUMBERS_OWNER_EMAIL/);
 
@@ -66,4 +66,13 @@ test('il proprietario è quello indicato, o l\'unico utente che ha un\'azienda',
     await assert.rejects(() => access.resolveOwner(twoOwners, {}), /NUMBERS_OWNER_EMAIL/);
     const nobody = pool(() => []);
     await assert.rejects(() => access.resolveOwner(nobody, {}), /NUMBERS_OWNER_EMAIL/);
+});
+
+test('l\'email del proprietario si trova anche se Gmail era stata salvata senza punti', async () => {
+    assert.deepStrictEqual(access.emailVariants(' Mario.Rossi+lavoro@Gmail.com '), ['mario.rossi+lavoro@gmail.com', 'mariorossi@gmail.com']);
+    assert.deepStrictEqual(access.emailVariants('mario.rossi@azienda.it'), ['mario.rossi@azienda.it']);
+    assert.deepStrictEqual(access.emailVariants('mariorossi@gmail.com'), ['mariorossi@gmail.com']);
+    const stored = { id: 4, email: 'mariorossi@gmail.com', name: 'Mario' };
+    const pool = { query: async (sql, params) => ({ rows: params[0].includes(stored.email) ? [stored] : [] }) };
+    assert.deepStrictEqual(await access.resolveOwner(pool, { NUMBERS_OWNER_EMAIL: 'Mario.Rossi@gmail.com' }), stored);
 });
