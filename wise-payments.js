@@ -9,6 +9,11 @@ const wise = require('./wise');
 
 const REFRESH_LIMIT = 25; // quanti bonifici non chiusi si ricontrollano a ogni apertura della pagina
 
+// I bonifici NON finiscono nelle Spese di Numbers (Federico, 11/10/2026: «toglile, non farle andare»).
+// Si vedono solo nella pagina Pagamenti. Il codice che segnava la spesa resta sotto, spento: per
+// riaccenderlo basta questo interruttore, ma è una decisione da rifare con lui.
+const TRACK_EXPENSES = false;
+
 async function ensureTable(pool) {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS wise_payments (
@@ -154,9 +159,9 @@ async function refresh(pool, client, companyId, toEurRate, now = new Date()) {
         `SELECT * FROM wise_payments
          WHERE company_id = $1 AND wise_transfer_id IS NOT NULL
            AND (status NOT IN ('outgoing_payment_sent', 'cancelled', 'funds_refunded', 'charged_back')
-                OR (track_expense = TRUE AND expense_id IS NULL AND status = 'outgoing_payment_sent'))
+                OR ($3::boolean AND track_expense = TRUE AND expense_id IS NULL AND status = 'outgoing_payment_sent'))
          ORDER BY created_at DESC LIMIT $2`,
-        [companyId, REFRESH_LIMIT]
+        [companyId, REFRESH_LIMIT, TRACK_EXPENSES]
     );
     let changed = 0;
     for (const row of open.rows) {
@@ -173,7 +178,7 @@ async function refresh(pool, client, companyId, toEurRate, now = new Date()) {
                     changed++;
                 }
             }
-            if (wise.shouldTrackExpense(current)) {
+            if (TRACK_EXPENSES && wise.shouldTrackExpense(current)) {
                 await trackExpense(pool, current, toEurRate, now);
                 changed++;
             }
@@ -235,7 +240,7 @@ async function prepare(pool, client, companyId, input, limits = {}) {
              ON CONFLICT (company_id, client_key) DO NOTHING RETURNING *`,
             [companyId, key, recipient.id, recipient.name, quote.targetAmount, quote.targetCurrency,
              quote.sourceAmount, quote.sourceCurrency, quote.fee, reference || null,
-             String(input.category || '').trim().slice(0, 100) || null, input.trackExpense !== false]
+             String(input.category || '').trim().slice(0, 100) || null, TRACK_EXPENSES && input.trackExpense !== false]
         );
         row = ins.rows[0] || (await byKey()).rows[0];
         if (row.wise_transfer_id) return row;
@@ -271,4 +276,4 @@ async function cancel(pool, client, companyId, paymentId) {
     return up.rows[0];
 }
 
-module.exports = { ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, cancel, getLabels, saveLabels, cleanLabel };
+module.exports = { TRACK_EXPENSES, ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, cancel, getLabels, saveLabels, cleanLabel };
