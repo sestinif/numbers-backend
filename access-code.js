@@ -15,7 +15,9 @@
 
 const crypto = require('node:crypto');
 
-const MIN_LENGTH = 24; // sotto questa lunghezza un codice si può indovinare a tentativi
+// Sotto questa lunghezza il server avvisa nei log. 12 caratteri casuali tra lettere e cifre sono
+// circa 71 bit: con 10 tentativi ogni 15 minuti non si indovinano. Federico ne usa 13 (11/10/2026).
+const MIN_LENGTH = 12;
 
 function configured(env) {
     const code = env && typeof env.NUMBERS_ACCESS_CODE === 'string' ? env.NUMBERS_ACCESS_CODE.trim() : '';

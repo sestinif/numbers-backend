@@ -31,7 +31,8 @@ test('se il codice non è configurato non entra nessuno, nemmeno col vuoto', () 
 test('un codice corto viene segnalato come debole', () => {
     assert.strictEqual(access.isStrong(ENV), true);
     assert.strictEqual(access.isStrong({ NUMBERS_ACCESS_CODE: 'password123' }), false);
-    assert.strictEqual(access.MIN_LENGTH, 24);
+    assert.strictEqual(access.isStrong({ NUMBERS_ACCESS_CODE: 'a8Kq2ZpT1xYw7' }), true, '13 caratteri vanno bene');
+    assert.strictEqual(access.MIN_LENGTH, 12);
 });
 
 test('la versione cambia quando cambia il codice, e non lo rivela', () => {
