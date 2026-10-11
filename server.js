@@ -173,46 +173,7 @@ app.post('/api/auth/code', codeLimiter, async (req, res) => {
     }
 });
 
-// Register
-app.post('/api/auth/register', emailAuthOnly, authLimiter, [
-    body('email').isEmail().normalizeEmail(),
-    body('password').isLength({ min: 6 }),
-    body('name').optional().trim()
-], async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-    }
-
-    const { email, password, name } = req.body;
-
-    try {
-        // Check if user exists
-        const userExists = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-        if (userExists.rows.length > 0) {
-            return res.status(400).json({ error: 'Email già registrata' });
-        }
-
-        // Hash password
-        const passwordHash = await bcrypt.hash(password, 10);
-
-        // Create user
-        const result = await pool.query(
-            'INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id, email, name, created_at',
-            [email, passwordHash, name]
-        );
-
-        const user = result.rows[0];
-
-        // Generate token
-        const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
-
-        res.status(201).json({ user, token });
-    } catch (error) {
-        console.error('Errore registrazione:', error);
-        res.status(500).json({ error: 'Errore durante la registrazione' });
-    }
-});
+// La registrazione è stata tolta (11/10/2026): Numbers ha un utente solo, non se ne creano altri da fuori.
 
 // Login
 app.post('/api/auth/login', emailAuthOnly, authLimiter, [
@@ -1631,7 +1592,7 @@ app.get('/', (req, res) => {
     res.json({
         message: 'Numbers API Server',
         version: '1.0.0',
-        endpoints: ['/api/auth/register', '/api/auth/login', '/api/health']
+        endpoints: ['/api/health']
     });
 });
 
