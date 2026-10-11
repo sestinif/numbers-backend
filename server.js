@@ -13,6 +13,7 @@ require('dotenv').config();
 const aiCosts = require('./ai-costs');
 const recurring = require('./recurring');
 const wise = require('./wise');
+const accessCode = require('./access-code');
 const wisePayments = require('./wise-payments');
 
 // Multer: memory storage, 5MB max, only images/pdf
@@ -120,6 +121,11 @@ const authenticateToken = (req, res, next) => {
         if (err) {
             return res.status(403).json({ error: 'Token non valido' });
         }
+        // Accesso a codice attivo: vale solo il gettone nato col codice in uso adesso.
+        // Cambiare il codice su Render butta fuori tutti all'istante.
+        if (!accessCode.tokenStillValid(user, process.env)) {
+            return res.status(403).json({ error: 'Accesso scaduto: entra di nuovo con il codice' });
+        }
         req.user = user;
         next();
     });
@@ -127,8 +133,48 @@ const authenticateToken = (req, res, next) => {
 
 // ============= AUTH ROUTES =============
 
+// Accesso con un codice solo (vedi access-code.js). Attivo quando su Render c'è NUMBERS_ACCESS_CODE.
+if (accessCode.isEnabled(process.env) && !accessCode.isStrong(process.env)) {
+    console.warn(`[accesso] NUMBERS_ACCESS_CODE è più corto di ${accessCode.MIN_LENGTH} caratteri: usane uno lungo e casuale.`);
+}
+
+// Con l'accesso a codice attivo le porte vecchie (email, registrazione, recupero password) sono chiuse.
+const emailAuthOnly = (req, res, next) => {
+    if (accessCode.isEnabled(process.env)) return res.status(404).json({ error: 'Accesso con email disattivato' });
+    next();
+};
+
+// Pochi tentativi: un codice lungo non si indovina, ma non c'è motivo di lasciar provare.
+const codeLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    message: { error: 'Troppi tentativi. Riprova tra 15 minuti.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// La pagina di accesso chiede quale modulo mostrare. Non dice nient'altro.
+app.get('/api/auth/mode', (req, res) => {
+    res.json({ mode: accessCode.isEnabled(process.env) ? 'code' : 'password' });
+});
+
+app.post('/api/auth/code', codeLimiter, async (req, res) => {
+    if (!accessCode.isEnabled(process.env)) return res.status(404).json({ error: 'Accesso a codice non attivo' });
+    if (!accessCode.matches(req.body && req.body.code, process.env)) {
+        return res.status(401).json({ error: 'Codice non valido' });
+    }
+    try {
+        const user = await accessCode.resolveOwner(pool, process.env);
+        const token = jwt.sign({ id: user.id, email: user.email, cv: accessCode.version(process.env) }, JWT_SECRET, { expiresIn: '30d' });
+        res.json({ user: { id: user.id, email: user.email, name: user.name }, token });
+    } catch (error) {
+        console.error('Errore accesso con codice:', error.message);
+        res.status(500).json({ error: 'Accesso non configurato bene sul server' });
+    }
+});
+
 // Register
-app.post('/api/auth/register', authLimiter, [
+app.post('/api/auth/register', emailAuthOnly, authLimiter, [
     body('email').isEmail().normalizeEmail(),
     body('password').isLength({ min: 6 }),
     body('name').optional().trim()
@@ -169,7 +215,7 @@ app.post('/api/auth/register', authLimiter, [
 });
 
 // Login
-app.post('/api/auth/login', authLimiter, [
+app.post('/api/auth/login', emailAuthOnly, authLimiter, [
     body('email').isEmail().normalizeEmail(),
     body('password').notEmpty()
 ], async (req, res) => {
@@ -231,7 +277,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 });
 
 // Forgot Password - Request reset
-app.post('/api/auth/forgot-password', authLimiter, [
+app.post('/api/auth/forgot-password', emailAuthOnly, authLimiter, [
     body('email').isEmail().normalizeEmail()
 ], async (req, res) => {
     const errors = validationResult(req);
@@ -317,7 +363,7 @@ app.post('/api/auth/forgot-password', authLimiter, [
 });
 
 // Reset Password - Verify token and update password
-app.post('/api/auth/reset-password', authLimiter, [
+app.post('/api/auth/reset-password', emailAuthOnly, authLimiter, [
     body('token').notEmpty(),
     body('newPassword').isLength({ min: 6 })
 ], async (req, res) => {
