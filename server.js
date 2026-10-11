@@ -14,6 +14,8 @@ const aiCosts = require('./ai-costs');
 const recurring = require('./recurring');
 const wise = require('./wise');
 const accessCode = require('./access-code');
+const gmail = require('./gmail');
+const mailLog = require('./mail-log');
 const wisePayments = require('./wise-payments');
 
 // Multer: memory storage, 5MB max, only images/pdf
@@ -61,7 +63,9 @@ app.use(cors({
 }));
 
 // Limite body JSON: 1MB (gli upload file passano da multer, non da JSON, quindi è sicuro)
-app.use(express.json({ limit: '1mb' }));
+const jsonSmall = express.json({ limit: '1mb' });
+const jsonWithAttachments = express.json({ limit: '12mb' }); // solo per l'invio di un'email: porta gli allegati in base64
+app.use((req, res, next) => (/^\/api\/companies\/[^/]+\/email\/send$/.test(req.path) ? jsonWithAttachments : jsonSmall)(req, res, next));
 app.use(express.static('../frontend'));
 
 // Rate limiting - protezione brute force
@@ -484,6 +488,12 @@ app.get('/api/companies/:companyId/customers', authenticateToken, async (req, re
     }
 });
 
+// L'email di un cliente: una o più, separate da virgola. Vuota = nessuna. Scritta male = errore.
+function customerEmail(value) {
+    const list = gmail.parseAddresses(value);
+    return list.length ? list.join(', ').slice(0, 300) : null;
+}
+
 // Create customer
 app.post('/api/companies/:companyId/customers', authenticateToken, [
     body('name').notEmpty().trim()
@@ -495,6 +505,8 @@ app.post('/api/companies/:companyId/customers', authenticateToken, [
 
     const { companyId } = req.params;
     const { name, address, vat } = req.body;
+    let email;
+    try { email = customerEmail(req.body.email); } catch (e) { return res.status(400).json({ error: e.message }); }
 
     try {
         // Check ownership
@@ -504,8 +516,8 @@ app.post('/api/companies/:companyId/customers', authenticateToken, [
         }
 
         const result = await pool.query(
-            'INSERT INTO customers (company_id, name, address, vat) VALUES ($1, $2, $3, $4) RETURNING *',
-            [companyId, name, address, vat]
+            'INSERT INTO customers (company_id, name, address, vat, email) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+            [companyId, name, address, vat, email]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -529,10 +541,21 @@ app.put('/api/customers/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Cliente non trovato' });
         }
 
-        const result = await pool.query(
-            'UPDATE customers SET name = $1, address = $2, vat = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4 RETURNING *',
-            [name, address, vat, id]
-        );
+        // L'email cambia solo se la richiesta la porta: una pagina vecchia che non la manda non la cancella.
+        let result;
+        if (req.body.email !== undefined) {
+            let email;
+            try { email = customerEmail(req.body.email); } catch (e) { return res.status(400).json({ error: e.message }); }
+            result = await pool.query(
+                'UPDATE customers SET name = $1, address = $2, vat = $3, email = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $5 RETURNING *',
+                [name, address, vat, email, id]
+            );
+        } else {
+            result = await pool.query(
+                'UPDATE customers SET name = $1, address = $2, vat = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4 RETURNING *',
+                [name, address, vat, id]
+            );
+        }
         res.json(result.rows[0]);
     } catch (error) {
         console.error('Errore update customer:', error);
@@ -1603,6 +1626,62 @@ app.post('/api/companies/:companyId/wise/recipients', authenticateToken, async (
     }
 });
 
+// ============= EMAIL (GMAIL, SOLO INVIO) =============
+// Numbers manda email dalla casella dell'azienda. Non legge la posta: vedi gmail.js.
+
+function mailFail(res, error, fallback) {
+    if (error instanceof gmail.MailError) {
+        // 401 e 403 farebbero uscire l'utente da Numbers: qui non devono mai arrivare alla pagina.
+        const status = error.status === 401 || error.status === 403 ? 502 : error.status;
+        return res.status(status).json({ error: error.message });
+    }
+    console.error(fallback + ':', error.message);
+    res.status(500).json({ error: fallback });
+}
+
+function mailDailyLimit() {
+    const n = parseInt(process.env.GMAIL_MAX_PER_DAY, 10);
+    return Number.isFinite(n) && n > 0 ? n : 50;
+}
+
+// Stato del collegamento e registro delle email partite.
+app.get('/api/companies/:companyId/email', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        const configured = gmail.isConfigured(process.env);
+        res.json({
+            configured,
+            from: configured ? process.env.GMAIL_FROM.trim().toLowerCase() : null,
+            copyToOwner: configured && gmail.parseAddresses(process.env.GMAIL_BCC || '').length > 0,
+            sent: await mailLog.list(pool, companyId),
+        });
+    } catch (error) {
+        mailFail(res, error, 'Errore nel recupero delle email');
+    }
+});
+
+// Invia un'email. Corpo: { to, subject, text, attachments: [{ filename, mimeType, base64 }], invoiceId }
+app.post('/api/companies/:companyId/email/send', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!gmail.isConfigured(process.env)) return res.status(400).json({ error: 'La casella email non è collegata' });
+        const body = req.body || {};
+        const to = gmail.parseAddresses(body.to);
+        const attachments = gmail.readAttachments(body.attachments);
+        const sentToday = await mailLog.countToday(pool, companyId);
+        if (sentToday >= mailDailyLimit()) {
+            return res.status(429).json({ error: `Tetto di sicurezza raggiunto: oggi sono già partite ${sentToday} email. Riprova domani.` });
+        }
+        const sent = await gmail.createClient({ env: process.env }).send({ to, subject: body.subject, text: body.text, attachments });
+        const row = await mailLog.record(pool, companyId, { to, subject: body.subject, text: body.text, attachments, invoiceId: body.invoiceId, gmailId: sent.id });
+        res.status(201).json({ id: row.id, recipients: row.recipients, subject: row.subject, created_at: row.created_at });
+    } catch (error) {
+        mailFail(res, error, 'Errore nell\'invio dell\'email');
+    }
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
@@ -1787,6 +1866,13 @@ async function runMigrations() {
         await wisePayments.ensureTable(pool);
         results.push('M13: wise_payments creata ✅');
     } catch (e) { results.push('M13 skipped: ' + e.message); }
+
+    // Migration 14: email dei clienti e registro delle email partite da Numbers.
+    try {
+        await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS email VARCHAR(300)`);
+        await mailLog.ensureTable(pool);
+        results.push('M14: customers.email e sent_emails ✅');
+    } catch (e) { results.push('M14 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
