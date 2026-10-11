@@ -12,6 +12,8 @@ const helmet = require('helmet');
 require('dotenv').config();
 const aiCosts = require('./ai-costs');
 const recurring = require('./recurring');
+const wise = require('./wise');
+const wisePayments = require('./wise-payments');
 
 // Multer: memory storage, 5MB max, only images/pdf
 const receiptUpload = multer({
@@ -1463,6 +1465,116 @@ app.delete('/api/receipts/:receiptId', authenticateToken, async (req, res) => {
     }
 });
 
+// ============= PAGAMENTI (WISE) =============
+// Numbers PREPARA i bonifici dal conto Wise della LLC; a farli partire è Federico, dall'app di Wise.
+// Vedi wise.js: la chiamata che paga un bonifico qui non esiste.
+
+async function ownCompany(companyId, userId) {
+    const r = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [companyId, userId]);
+    return r.rows.length > 0;
+}
+
+// Freni di sicurezza, regolabili da Render senza toccare il codice:
+//   WISE_MAX_PER_DAY  quanti bonifici si possono preparare in un giorno (se manca: 20)
+//   WISE_MAX_AMOUNT   cifra massima per bonifico, nella valuta del beneficiario (se manca: nessun tetto)
+// Per spegnere tutto subito: togliere WISE_API_TOKEN da Render, o cancellare il token su Wise.
+function wiseLimits() {
+    const perDay = parseInt(process.env.WISE_MAX_PER_DAY, 10);
+    const maxAmount = parseFloat(process.env.WISE_MAX_AMOUNT);
+    return {
+        maxPerDay: Number.isFinite(perDay) && perDay > 0 ? perDay : 20,
+        maxAmount: Number.isFinite(maxAmount) && maxAmount > 0 ? maxAmount : null,
+    };
+}
+
+function wiseFail(res, error, fallback) {
+    if (error instanceof wise.WiseError) {
+        // Un 401 o 403 di Wise riguarda il token di Wise, non l'accesso a Numbers: la pagina di Numbers
+        // a quei due codici fa uscire l'utente, quindi qui diventano 502.
+        const passthrough = error.status >= 400 && error.status < 500 && error.status !== 401 && error.status !== 403;
+        const status = passthrough ? error.status : 502;
+        return res.status(status).json({ error: error.message });
+    }
+    console.error(fallback + ':', error.message);
+    res.status(500).json({ error: fallback });
+}
+
+// Tutto quello che serve alla pagina: saldi, beneficiari, bonifici preparati con lo stato aggiornato.
+app.get('/api/companies/:companyId/wise', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!wise.isConfigured(process.env)) return res.json({ configured: false });
+        const client = wise.clientFromEnv(process.env);
+        const [balances, recipients] = await Promise.all([client.balances(), client.recipients()]);
+        const changed = await wisePayments.refresh(pool, client, companyId, aiCosts.toEurRate);
+        const payments = (await wisePayments.listPayments(pool, companyId)).map(wisePayments.publicPayment);
+        res.json({ configured: true, balances, recipients, payments, changed });
+    } catch (error) {
+        wiseFail(res, error, 'Errore nel collegamento a Wise');
+    }
+});
+
+// Preventivo: quanto esce dal saldo, costo e arrivo. Non impegna niente.
+app.post('/api/companies/:companyId/wise/quote', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
+        const client = wise.clientFromEnv(process.env);
+        const recipient = (await client.recipients()).find(r => String(r.id) === String(req.body.recipientId));
+        if (!recipient) return res.status(400).json({ error: 'Beneficiario non trovato su Wise.' });
+        const quote = await client.quote({
+            recipientId: recipient.id,
+            amount: req.body.amount,
+            targetCurrency: recipient.currency,
+            sourceCurrency: String(req.body.sourceCurrency || recipient.currency).toUpperCase(),
+        });
+        res.json(quote);
+    } catch (error) {
+        wiseFail(res, error, 'Errore nel preventivo');
+    }
+});
+
+// Prepara il bonifico su Wise. Resta in attesa finché non viene confermato nell'app di Wise.
+app.post('/api/companies/:companyId/wise/payments', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
+        const row = await wisePayments.prepare(pool, wise.clientFromEnv(process.env), companyId, req.body || {}, wiseLimits());
+        res.status(201).json(wisePayments.publicPayment(row));
+    } catch (error) {
+        wiseFail(res, error, 'Errore nella preparazione del bonifico');
+    }
+});
+
+// Annulla un bonifico ancora in attesa.
+app.post('/api/companies/:companyId/wise/payments/:paymentId/cancel', authenticateToken, async (req, res) => {
+    const { companyId, paymentId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
+        const row = await wisePayments.cancel(pool, wise.clientFromEnv(process.env), companyId, paymentId);
+        res.json(wisePayments.publicPayment(row));
+    } catch (error) {
+        wiseFail(res, error, 'Errore nell\'annullamento del bonifico');
+    }
+});
+
+// Beneficiario nuovo in euro, con IBAN. Gli altri tipi di conto si aggiungono da Wise.
+app.post('/api/companies/:companyId/wise/recipients', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
+        const made = await wise.clientFromEnv(process.env).createIbanRecipient(req.body || {});
+        res.status(201).json(made);
+    } catch (error) {
+        wiseFail(res, error, 'Errore nella creazione del beneficiario');
+    }
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
@@ -1641,6 +1753,12 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS amount_confirmed BOOLEAN NOT NULL DEFAULT TRUE`);
         results.push('M12: conto e tipo su regole e spese ✅');
     } catch (e) { results.push('M12 skipped: ' + e.message); }
+
+    // Migration 13: registro dei bonifici preparati su Wise.
+    try {
+        await wisePayments.ensureTable(pool);
+        results.push('M13: wise_payments creata ✅');
+    } catch (e) { results.push('M13 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;

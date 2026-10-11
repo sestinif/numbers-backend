@@ -248,4 +248,4 @@ async function syncIfStale(pool, company) {
     await Promise.race([runningByCompany[id], new Promise(resolve => setTimeout(resolve, SYNC_TIMEOUT_MS))]);
 }
 
-module.exports = { syncIfStale, syncCompany, isTargetCompany };
+module.exports = { syncIfStale, syncCompany, isTargetCompany, toEurRate };
