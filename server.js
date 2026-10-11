@@ -1521,8 +1521,10 @@ app.get('/api/companies/:companyId/wise', authenticateToken, async (req, res) =>
         const client = wise.clientFromEnv(process.env);
         const [balances, recipients] = await Promise.all([client.balances(), client.recipients()]);
         const changed = await wisePayments.refresh(pool, client, companyId, aiCosts.toEurRate);
-        const payments = (await wisePayments.listPayments(pool, companyId)).map(wisePayments.publicPayment);
-        res.json({ configured: true, balances, recipients, payments, changed });
+        const labels = await wisePayments.getLabels(pool, companyId);
+        const named = recipients.map(r => ({ ...r, label: labels[String(r.id)] || null }));
+        const payments = (await wisePayments.listPayments(pool, companyId)).map(row => wisePayments.publicPayment(row, labels));
+        res.json({ configured: true, balances, recipients: named, payments, changed });
     } catch (error) {
         wiseFail(res, error, 'Errore nel collegamento a Wise');
     }
@@ -1572,6 +1574,19 @@ app.post('/api/companies/:companyId/wise/payments/:paymentId/cancel', authentica
         res.json(wisePayments.publicPayment(row));
     } catch (error) {
         wiseFail(res, error, 'Errore nell\'annullamento del bonifico');
+    }
+});
+
+// I nomi dati ai beneficiari in Numbers. Non tocca Wise: lì restano i nomi legali.
+app.put('/api/companies/:companyId/wise/recipient-labels', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        const saved = await wisePayments.saveLabels(pool, companyId, req.body && req.body.labels);
+        res.json({ saved, labels: await wisePayments.getLabels(pool, companyId) });
+    } catch (error) {
+        console.error('Errore nomi beneficiari:', error.message);
+        res.status(500).json({ error: 'Errore nel salvataggio dei nomi' });
     }
 });
 

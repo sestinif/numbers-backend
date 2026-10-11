@@ -33,13 +33,57 @@ async function ensureTable(pool) {
         )`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_wise_payments_key ON wise_payments(company_id, client_key)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_wise_payments_company ON wise_payments(company_id, created_at DESC)`);
+    // I nomi che Federico dà ai beneficiari («Assistente», «Mio conto N26»): vivono solo in Numbers,
+    // su Wise il beneficiario resta col suo nome legale.
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS wise_recipient_labels (
+            company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+            recipient_id BIGINT NOT NULL,
+            label VARCHAR(60) NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (company_id, recipient_id)
+        )`);
 }
 
-function publicPayment(row) {
+function cleanLabel(value) {
+    return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, 60);
+}
+
+// { '<id beneficiario>': 'nome dato in Numbers' }
+async function getLabels(pool, companyId) {
+    const r = await pool.query(`SELECT recipient_id, label FROM wise_recipient_labels WHERE company_id = $1`, [companyId]);
+    const out = {};
+    for (const row of r.rows) out[String(row.recipient_id)] = row.label;
+    return out;
+}
+
+// list = [{ recipientId, label }]. Un nome vuoto toglie quello che c'era.
+async function saveLabels(pool, companyId, list) {
+    let saved = 0;
+    for (const item of Array.isArray(list) ? list.slice(0, 500) : []) {
+        const id = String(item && item.recipientId != null ? item.recipientId : '').trim();
+        if (!/^\d{1,18}$/.test(id)) continue;
+        const label = cleanLabel(item.label);
+        if (!label) {
+            await pool.query(`DELETE FROM wise_recipient_labels WHERE company_id = $1 AND recipient_id = $2`, [companyId, id]);
+        } else {
+            await pool.query(
+                `INSERT INTO wise_recipient_labels (company_id, recipient_id, label) VALUES ($1, $2, $3)
+                 ON CONFLICT (company_id, recipient_id) DO UPDATE SET label = EXCLUDED.label, updated_at = CURRENT_TIMESTAMP`,
+                [companyId, id, label]
+            );
+        }
+        saved++;
+    }
+    return saved;
+}
+
+function publicPayment(row, labels) {
     const info = wise.statusInfo(row.status);
     return {
         id: row.id,
         recipient_name: row.recipient_name,
+        recipient_label: (labels && labels[String(row.recipient_id)]) || null,
         target_amount: row.target_amount,
         target_currency: row.target_currency,
         source_amount: row.source_amount,
@@ -227,4 +271,4 @@ async function cancel(pool, client, companyId, paymentId) {
     return up.rows[0];
 }
 
-module.exports = { ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, cancel };
+module.exports = { ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, cancel, getLabels, saveLabels, cleanLabel };
