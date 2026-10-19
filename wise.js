@@ -1,11 +1,12 @@
 // Numbers — collegamento a Wise (conto business della LLC)
 //
-// Cosa fa: legge saldi e beneficiari, chiede un preventivo, PREPARA un bonifico.
-// Cosa NON fa, apposta: far partire i soldi. Il bonifico preparato resta su Wise
-// «in attesa di pagamento» finché Federico non lo conferma nell'app di Wise.
-// In questo file non esiste la chiamata che paga un bonifico (…/transfers/{id}/payments):
-// chi usa Numbers può preparare, mai inviare. Se un giorno servisse, è una scelta
-// da rifare con Federico, non una riga da aggiungere di passaggio.
+// Cosa fa: legge saldi e beneficiari, chiede un preventivo, PREPARA un bonifico e, su richiesta,
+// lo FA PARTIRE (fundTransfer: paga dal saldo Wise). Preparare e pagare sono due chiamate
+// separate: un bonifico preparato resta su Wise «in attesa di pagamento» finché qualcuno non
+// lo paga, dall'app di Wise o da Numbers.
+// fundTransfer è l'unica chiamata che muove soldi. Dal 19/10/2026, per scelta di Federico, la
+// usa solo la rotta protetta dal PIN (vedi pay-pin.js e server.js): senza PIN configurato su
+// Render nessuno può chiamarla. Non va mai chiamata da altre parti.
 //
 // Token: variabile d'ambiente WISE_API_TOKEN (token personale «full access» creato su Wise:
 // Your Account → Connect and manage apps → API tokens). Viaggia solo nell'intestazione
@@ -35,6 +36,8 @@ function isConfigured(env) {
 
 const STATUS = {
     incoming_payment_waiting: { state: 'waiting', label: 'Da confermare su Wise', final: false },
+    // Numbers sta pagando adesso il bonifico (vedi wise-payments.js): blocca un secondo invio in parallelo.
+    sending: { state: 'paid', label: 'In invio', final: false },
     incoming_payment_initiated: { state: 'paid', label: 'In lavorazione', final: false },
     processing: { state: 'paid', label: 'In lavorazione', final: false },
     funds_converted: { state: 'paid', label: 'In lavorazione', final: false },
@@ -96,6 +99,19 @@ function summarizeRecipient(raw) {
         account: maskAccount(raw.details),
     };
 }
+
+// Perché Wise ha rifiutato un pagamento, in parole di Federico. Un codice nuovo cade sul messaggio generico.
+const FUND_REJECTIONS = {
+    'balance.insufficient-funds': 'Il saldo Wise non basta per questo bonifico.',
+    'balance.no-balance-for-currency': 'Non c\'è un saldo Wise in questa valuta da cui pagare.',
+    'balance.currency-unsupported': 'Questa valuta non si può pagare dal saldo Wise.',
+    'balance.account-inactive': 'Il saldo Wise da cui pagare non è attivo.',
+    'balance.account-not-found': 'Il saldo Wise da cui pagare non c\'è.',
+    'balance.payment-option-unavailable': 'Dal saldo Wise questo bonifico adesso non si può pagare.',
+    'payment.option-unavailable': 'Dal saldo Wise questo bonifico adesso non si può pagare.',
+    'transfer.invalid-state': 'Il bonifico non è più in attesa: è già partito o è stato annullato.',
+    'transfer.not-found': 'Wise non trova questo bonifico.',
+};
 
 function positiveAmount(value) {
     const n = typeof value === 'number' ? value : parseFloat(value);
@@ -227,12 +243,36 @@ function createClient({ token, baseUrl, profileId, fetchImpl } = {}) {
         return request('GET', `/v1/transfers/${Number(transferId)}`);
     }
 
+    // FA PARTIRE I SOLDI: paga il bonifico dal saldo. Da chiamare solo dalla rotta protetta dal PIN.
+    // Un bonifico già pagato non è un errore (already: true): si risincronizza e basta.
+    // Se il conto non permette di pagare da API il bonifico resta preparato, e lo si conferma dall'app.
+    async function fundTransfer(transferId) {
+        const profile = await getProfileId();
+        let data;
+        try {
+            data = await request('POST', `/v3/profiles/${profile}/transfers/${Number(transferId)}/payments`, { type: 'BALANCE' });
+        } catch (e) {
+            if (e instanceof WiseError && e.status === 403) {
+                throw new WiseError('Wise non lascia far partire il bonifico da Numbers (serve un token «full access» su un conto che lo permetta). Il bonifico resta preparato: confermalo dall\'app di Wise.', 502);
+            }
+            throw e;
+        }
+        if (data && data.status === 'REJECTED') {
+            if (data.errorCode === 'payment.exists') return { status: 'COMPLETED', already: true };
+            throw new WiseError(FUND_REJECTIONS[data.errorCode] || 'Wise ha rifiutato il pagamento del bonifico.', 422);
+        }
+        if (!data || (data.status !== 'COMPLETED' && data.status !== 'CREATED')) {
+            throw new WiseError('Wise ha risposto in un modo che non riconosco: controlla lo stato del bonifico nell\'app di Wise prima di riprovare.', 502);
+        }
+        return { status: data.status, already: false };
+    }
+
     // Wise lo permette solo finché il bonifico è in attesa di pagamento.
     function cancelTransfer(transferId) {
         return request('PUT', `/v1/transfers/${Number(transferId)}/cancel`);
     }
 
-    return { profileId: getProfileId, balances, recipients, createIbanRecipient, quote, createTransfer, getTransfer, cancelTransfer };
+    return { profileId: getProfileId, balances, recipients, createIbanRecipient, quote, createTransfer, fundTransfer, getTransfer, cancelTransfer };
 }
 
 function clientFromEnv(env) {

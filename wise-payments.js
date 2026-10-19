@@ -3,7 +3,8 @@
 // Ogni bonifico preparato da Numbers ha una riga in wise_payments: serve a mostrare la lista
 // con lo stato, a non crearne due uguali (chiave anti-doppione) e a segnare la spesa UNA volta,
 // quando i soldi sono partiti davvero. Chi parla con Wise è wise.js; qui c'è solo il registro.
-// Numbers prepara e basta: a far partire i soldi è Federico, dall'app di Wise.
+// Un bonifico preparato aspetta su Wise finché qualcuno lo paga: dall'app di Wise, oppure da
+// Numbers con send() qui sotto. send() è chiamata SOLO dalla rotta protetta dal PIN (server.js).
 
 const wise = require('./wise');
 
@@ -263,6 +264,49 @@ async function prepare(pool, client, companyId, input, limits = {}) {
     return up.rows[0];
 }
 
+// FA PARTIRE un bonifico preparato: lo paga dal saldo Wise. Da chiamare solo dopo aver controllato il PIN.
+// Il passaggio da «in attesa» a «in invio» è una sola UPDATE condizionata: due richieste insieme
+// (doppio tocco, riprova) non possono pagare due volte, perché solo una trova la riga ancora in attesa.
+// Se Wise rifiuta, la riga torna in attesa e il bonifico si può confermare dall'app o riprovare.
+async function send(pool, client, companyId, paymentId, limits = {}) {
+    const found = await pool.query(`SELECT * FROM wise_payments WHERE id = $1 AND company_id = $2`, [paymentId, companyId]);
+    const row = found.rows[0];
+    if (!row || !row.wise_transfer_id) throw new wise.WiseError('Bonifico non trovato.', 404);
+    if (limits.maxAmount && Number(row.target_amount) > limits.maxAmount) {
+        throw new wise.WiseError(`Importo sopra il tetto di sicurezza (${limits.maxAmount} per bonifico). Questo bonifico va confermato dall'app di Wise.`, 400);
+    }
+    const claim = await pool.query(
+        `UPDATE wise_payments SET status = 'sending', updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND company_id = $2 AND status = 'incoming_payment_waiting' RETURNING *`,
+        [paymentId, companyId]
+    );
+    if (!claim.rows[0]) throw new wise.WiseError('Il bonifico non è più in attesa: è già partito, è in invio o è stato annullato.', 409);
+
+    let outcome;
+    try {
+        outcome = await client.fundTransfer(row.wise_transfer_id);
+    } catch (e) {
+        // Il pagamento non è partito: la riga torna in attesa (solo se nessuno l'ha già cambiata).
+        await pool.query(
+            `UPDATE wise_payments SET status = 'incoming_payment_waiting', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'sending'`,
+            [paymentId]
+        );
+        throw e;
+    }
+    // Lo stato vero lo dice Wise; se ancora «in attesa» o non risponde, il bonifico è pagato ma non
+    // ancora preso in carico: «in lavorazione», e la prossima apertura della pagina lo aggiorna.
+    let status = 'processing';
+    try {
+        const t = await client.getTransfer(row.wise_transfer_id);
+        if (t && t.status && t.status !== 'incoming_payment_waiting') status = t.status;
+    } catch (e) { /* si riallinea alla prossima apertura */ }
+    const up = await pool.query(
+        `UPDATE wise_payments SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`,
+        [status, paymentId]
+    );
+    return { row: up.rows[0], already: !!(outcome && outcome.already) };
+}
+
 // Annulla un bonifico ancora in attesa (dopo, Wise non lo permette più).
 async function cancel(pool, client, companyId, paymentId) {
     const r = await pool.query(`SELECT * FROM wise_payments WHERE id = $1 AND company_id = $2`, [paymentId, companyId]);
@@ -276,4 +320,4 @@ async function cancel(pool, client, companyId, paymentId) {
     return up.rows[0];
 }
 
-module.exports = { TRACK_EXPENSES, ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, cancel, getLabels, saveLabels, cleanLabel };
+module.exports = { TRACK_EXPENSES, ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, send, cancel, getLabels, saveLabels, cleanLabel };

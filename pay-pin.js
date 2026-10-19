@@ -84,4 +84,31 @@ function createGuard({ now, windowMs = 15 * 60 * 1000, maxPerWindow = 5, dayMs =
     return { check, fail, succeed, size };
 }
 
-module.exports = { isEnabled, matches, createGuard };
+// Il controllo completo di una richiesta che vuole far partire un bonifico.
+// Ritorna null se si può procedere, altrimenti { status, error } da rimandare alla pagina.
+// Mai 401/403: la pagina di Numbers a quei due codici fa uscire l'utente, e un PIN sbagliato no.
+function checkRequest({ guard, companyId, pin, env, log }) {
+    if (!isEnabled(env)) {
+        return { status: 400, error: 'L\'invio con il PIN non è attivo: i bonifici si confermano dall\'app di Wise.' };
+    }
+    const key = `company:${companyId}`;
+    const gate = guard.check(key);
+    if (!gate.allowed) {
+        const minutes = Math.ceil(gate.retryAfterSec / 60);
+        return {
+            status: 429,
+            error: minutes > 60
+                ? 'Troppi PIN sbagliati: l\'invio è fermo fino a domani.'
+                : `Troppi PIN sbagliati: l'invio è fermo, riprova tra ${minutes} minuti.`,
+        };
+    }
+    if (!matches(pin, env)) {
+        guard.fail(key);
+        if (log) log(`PIN sbagliato per l'azienda ${companyId}`);
+        return { status: 400, error: 'PIN sbagliato.' };
+    }
+    guard.succeed(key);
+    return null;
+}
+
+module.exports = { isEnabled, matches, createGuard, checkRequest };

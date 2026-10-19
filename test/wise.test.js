@@ -153,7 +153,7 @@ test('il bonifico si prepara con la chiave anti-doppione e la causale', async ()
     assert.strictEqual(t.status, 'incoming_payment_waiting');
 });
 
-test('il modulo non sa far partire i soldi: nessuna chiamata di pagamento', async () => {
+test('preparare, leggere e annullare un bonifico non fa mai partire i soldi', async () => {
     const { fetchImpl, calls } = fakeWise({
         'GET /v2/profiles': PROFILES, 'POST /v3/profiles/22/quotes': QUOTE,
         'POST /v1/transfers': { id: 900, status: 'incoming_payment_waiting' },
@@ -165,9 +165,38 @@ test('il modulo non sa far partire i soldi: nessuna chiamata di pagamento', asyn
     await client.createTransfer({ recipientId: 5, quoteId: 'q-1', reference: 'x', key: '11111111-2222-4333-8444-555555555555' });
     await client.getTransfer(900);
     assert.strictEqual((await client.cancelTransfer(900)).status, 'cancelled');
-    assert.ok(calls.every(c => !/payments/.test(c.key)), 'nessuna chiamata a /payments');
-    assert.strictEqual(typeof client.fundTransfer, 'undefined');
-    assert.strictEqual(typeof client.pay, 'undefined');
+    assert.ok(calls.every(c => !/payments/.test(c.key)), 'nessuna chiamata a /payments finché non si chiede di pagare');
+});
+
+test('far partire il bonifico: paga dal saldo, sul profilo business', async () => {
+    const { fetchImpl, calls } = fakeWise({
+        'GET /v2/profiles': PROFILES,
+        'POST /v3/profiles/22/transfers/900/payments': { status: 'COMPLETED', type: 'BALANCE', balanceTransactionId: 5 },
+    });
+    const client = wise.createClient({ token: 't', fetchImpl });
+    assert.deepStrictEqual(await client.fundTransfer(900), { status: 'COMPLETED', already: false });
+    assert.deepStrictEqual(calls[1].body, { type: 'BALANCE' });
+    assert.strictEqual(calls[1].key, 'POST /v3/profiles/22/transfers/900/payments');
+});
+
+test('se Wise rifiuta il pagamento l\'errore dice perché, in italiano', async () => {
+    const reject = code => fakeWise({ 'GET /v2/profiles': PROFILES, 'POST /v3/profiles/22/transfers/900/payments': { status: 'REJECTED', errorCode: code, errorMessage: 'x' } });
+    for (const [code, re] of [['balance.insufficient-funds', /saldo.*non basta/i], ['transfer.invalid-state', /non è più in attesa/i],
+                              ['balance.no-balance-for-currency', /saldo.*valuta/i], ['codice.nuovo.mai.visto', /rifiutato/i]]) {
+        const { fetchImpl } = reject(code);
+        await assert.rejects(() => wise.createClient({ token: 't', fetchImpl }).fundTransfer(900), e => re.test(e.message) && e.status === 422, code);
+    }
+});
+
+test('un bonifico già pagato non è un errore: si risincronizza e basta', async () => {
+    const { fetchImpl } = fakeWise({ 'GET /v2/profiles': PROFILES, 'POST /v3/profiles/22/transfers/900/payments': { status: 'REJECTED', errorCode: 'payment.exists' } });
+    assert.deepStrictEqual(await wise.createClient({ token: 't', fetchImpl }).fundTransfer(900), { status: 'COMPLETED', already: true });
+});
+
+test('se il conto non permette di pagare da API, il bonifico resta preparato e lo dice', async () => {
+    const { fetchImpl } = fakeWise({ 'GET /v2/profiles': PROFILES, 'POST /v3/profiles/22/transfers/900/payments': { __status: 403, body: { error: 'forbidden' } } });
+    await assert.rejects(() => wise.createClient({ token: 'tok-segreto', fetchImpl }).fundTransfer(900),
+        e => /resta preparato/i.test(e.message) && e.status === 502 && !e.message.includes('tok-segreto'));
 });
 
 test('un errore di Wise diventa un messaggio leggibile, senza il token dentro', async () => {
@@ -186,6 +215,7 @@ test('lo stato di Wise si traduce in quattro situazioni chiare', () => {
     assert.deepStrictEqual(wise.statusInfo('processing'), { state: 'paid', label: 'In lavorazione', final: false });
     assert.deepStrictEqual(wise.statusInfo('funds_converted'), { state: 'paid', label: 'In lavorazione', final: false });
     assert.deepStrictEqual(wise.statusInfo('outgoing_payment_sent'), { state: 'paid', label: 'Inviato', final: true });
+    assert.deepStrictEqual(wise.statusInfo('sending'), { state: 'paid', label: 'In invio', final: false });
     assert.deepStrictEqual(wise.statusInfo('cancelled'), { state: 'cancelled', label: 'Annullato', final: true });
     assert.deepStrictEqual(wise.statusInfo('funds_refunded'), { state: 'returned', label: 'Tornato indietro', final: true });
     assert.deepStrictEqual(wise.statusInfo('bounced_back'), { state: 'returned', label: 'Tornato indietro', final: false });

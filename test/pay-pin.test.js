@@ -100,3 +100,36 @@ test('la memoria dei tentativi non cresce senza fine', () => {
     for (let i = 0; i < 500; i++) { g.fail('a'); c.advance(1000); }
     assert.ok(g.size('a') <= 50, 'tiene solo gli ultimi tentativi: ' + g.size('a'));
 });
+
+test('una richiesta di invio: senza PIN attivo, con PIN sbagliato, con troppi sbagli, con PIN giusto', () => {
+    const c = clock();
+    const guard = pin.createGuard({ now: c.now });
+    const logs = [];
+    const ask = (given, env = ENV) => pin.checkRequest({ guard, companyId: 13, pin: given, env, log: m => logs.push(m) });
+
+    assert.deepStrictEqual(ask('4827', {}), { status: 400, error: 'L\'invio con il PIN non è attivo: i bonifici si confermano dall\'app di Wise.' });
+    assert.strictEqual(ask('4827'), null, 'PIN giusto: si procede');
+    assert.deepStrictEqual(ask('0000'), { status: 400, error: 'PIN sbagliato.' });
+    assert.strictEqual(logs.length, 1);
+    assert.ok(!logs.join(' ').includes('0000') && !logs.join(' ').includes('4827'), 'nei log non finisce nessun PIN');
+
+    for (let i = 0; i < 4; i++) ask('1111');
+    const blocked = ask('4827');
+    assert.strictEqual(blocked.status, 429, 'bloccato anche col PIN giusto: è questo che ferma chi prova a raffica');
+    assert.match(blocked.error, /riprova tra \d+ minuti/);
+    c.advance(16 * MIN);
+    assert.strictEqual(ask('4827'), null, 'passato il blocco si riparte');
+    assert.ok([400, 429].every(code => code !== 401 && code !== 403));
+});
+
+test('il blocco lungo dice «fino a domani»', () => {
+    const c = clock();
+    const guard = pin.createGuard({ now: c.now, maxPerDay: 6 });
+    const ask = given => pin.checkRequest({ guard, companyId: 1, pin: given, env: ENV });
+    let last;
+    for (let i = 0; i < 40 && !(last && last.status === 429 && /domani/.test(last.error)); i++) {
+        last = ask('1111');
+        if (last.status === 429) c.advance(last.error.match(/(\d+) minuti/) ? (parseInt(last.error.match(/(\d+) minuti/)[1], 10) * 60 + 1) * 1000 : 1000);
+    }
+    assert.match(last.error, /fino a domani/);
+});

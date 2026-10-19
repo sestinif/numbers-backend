@@ -17,6 +17,7 @@ const accessCode = require('./access-code');
 const gmail = require('./gmail');
 const mailLog = require('./mail-log');
 const wisePayments = require('./wise-payments');
+const payPin = require('./pay-pin');
 
 // Multer: memory storage, 5MB max, only images/pdf
 const receiptUpload = multer({
@@ -1523,6 +1524,14 @@ function wiseLimits() {
     };
 }
 
+// Il PIN per far partire i bonifici (pay-pin.js). I tentativi sbagliati si contano per azienda.
+const payGuard = payPin.createGuard();
+
+// Controlla il PIN di una richiesta: null se si può procedere, altrimenti { status, error }.
+function checkPayPin(companyId, pin) {
+    return payPin.checkRequest({ guard: payGuard, companyId, pin, env: process.env, log: m => console.warn('[pin] ' + m) });
+}
+
 function wiseFail(res, error, fallback) {
     if (error instanceof wise.WiseError) {
         // Un 401 o 403 di Wise riguarda il token di Wise, non l'accesso a Numbers: la pagina di Numbers
@@ -1547,7 +1556,7 @@ app.get('/api/companies/:companyId/wise', authenticateToken, async (req, res) =>
         const labels = await wisePayments.getLabels(pool, companyId);
         const named = recipients.map(r => ({ ...r, label: labels[String(r.id)] || null }));
         const payments = (await wisePayments.listPayments(pool, companyId)).map(row => wisePayments.publicPayment(row, labels));
-        res.json({ configured: true, balances, recipients: named, payments, changed });
+        res.json({ configured: true, directSend: payPin.isEnabled(process.env), balances, recipients: named, payments, changed });
     } catch (error) {
         wiseFail(res, error, 'Errore nel collegamento a Wise');
     }
@@ -1574,16 +1583,55 @@ app.post('/api/companies/:companyId/wise/quote', authenticateToken, async (req, 
     }
 });
 
-// Prepara il bonifico su Wise. Resta in attesa finché non viene confermato nell'app di Wise.
+// Prepara il bonifico su Wise. Con `send: true` e il PIN giusto lo fa anche partire subito.
+// Senza `send` resta in attesa finché non viene confermato nell'app di Wise (o da /send, col PIN).
+// Il PIN si controlla PRIMA di creare qualsiasi cosa: con un PIN sbagliato non nasce nessun bonifico.
 app.post('/api/companies/:companyId/wise/payments', authenticateToken, async (req, res) => {
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
         if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
-        const row = await wisePayments.prepare(pool, wise.clientFromEnv(process.env), companyId, req.body || {}, wiseLimits());
-        res.status(201).json(wisePayments.publicPayment(row));
+        const body = req.body || {};
+        const sendNow = body.send === true;
+        if (sendNow) {
+            const refused = checkPayPin(companyId, body.pin);
+            if (refused) return res.status(refused.status).json({ error: refused.error });
+        }
+        const client = wise.clientFromEnv(process.env);
+        const limits = wiseLimits();
+        let row = await wisePayments.prepare(pool, client, companyId, body, limits);
+        if (!sendNow) return res.status(201).json(wisePayments.publicPayment(row));
+        try {
+            const sent = await wisePayments.send(pool, client, companyId, row.id, limits);
+            console.log(`[bonifico] inviato dall'azienda ${companyId}: ${sent.row.id} (Wise ${sent.row.wise_transfer_id})`);
+            return res.status(201).json(wisePayments.publicPayment(sent.row));
+        } catch (error) {
+            // Il bonifico esiste ma non è partito: la pagina lo mostra in lista, in attesa.
+            const labels = await wisePayments.getLabels(pool, companyId);
+            const status = error instanceof wise.WiseError && error.status >= 400 && error.status < 500 && error.status !== 401 && error.status !== 403 ? error.status : 502;
+            return res.status(status).json({
+                error: `${error.message} Il bonifico è stato preparato ma non è partito: lo trovi in lista, puoi riprovare con il PIN o confermarlo dall'app di Wise.`,
+                payment: wisePayments.publicPayment((await wisePayments.listPayments(pool, companyId)).find(r => r.id === row.id) || row, labels),
+            });
+        }
     } catch (error) {
         wiseFail(res, error, 'Errore nella preparazione del bonifico');
+    }
+});
+
+// Fa partire un bonifico già preparato e ancora in attesa. Serve il PIN.
+app.post('/api/companies/:companyId/wise/payments/:paymentId/send', authenticateToken, async (req, res) => {
+    const { companyId, paymentId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
+        const refused = checkPayPin(companyId, (req.body || {}).pin);
+        if (refused) return res.status(refused.status).json({ error: refused.error });
+        const sent = await wisePayments.send(pool, wise.clientFromEnv(process.env), companyId, paymentId, wiseLimits());
+        console.log(`[bonifico] inviato dall'azienda ${companyId}: ${sent.row.id} (Wise ${sent.row.wise_transfer_id})`);
+        res.json(wisePayments.publicPayment(sent.row, await wisePayments.getLabels(pool, companyId)));
+    } catch (error) {
+        wiseFail(res, error, 'Errore nell\'invio del bonifico');
     }
 });
 
