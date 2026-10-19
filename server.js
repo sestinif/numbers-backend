@@ -1599,7 +1599,8 @@ app.post('/api/companies/:companyId/wise/payments', authenticateToken, async (re
         }
         const client = wise.clientFromEnv(process.env);
         const limits = wiseLimits();
-        let row = await wisePayments.prepare(pool, client, companyId, body, limits);
+        // Con l'invio immediato, se il saldo non basta il bonifico non nasce nemmeno (requireBalance).
+        let row = await wisePayments.prepare(pool, client, companyId, body, limits, { requireBalance: sendNow });
         if (!sendNow) return res.status(201).json(wisePayments.publicPayment(row));
         try {
             const sent = await wisePayments.send(pool, client, companyId, row.id, limits);

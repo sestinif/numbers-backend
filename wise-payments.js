@@ -196,7 +196,7 @@ async function refresh(pool, client, companyId, toEurRate, now = new Date()) {
 //
 // limits = freni di sicurezza: { maxPerDay, maxAmount }. Oltre il tetto del giorno o della cifra
 // Numbers si rifiuta di preparare, qualunque cosa arrivi dalla pagina.
-async function prepare(pool, client, companyId, input, limits = {}) {
+async function prepare(pool, client, companyId, input, limits = {}, opts = {}) {
     const key = String(input.clientKey || '').trim();
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key)) {
         throw new wise.WiseError('Richiesta non valida: ricarica la pagina e riprova.', 400);
@@ -232,6 +232,9 @@ async function prepare(pool, client, companyId, input, limits = {}) {
         sourceCurrency: String(input.sourceCurrency || recipient.currency).toUpperCase(),
     });
 
+    // Se il bonifico deve partire subito e il saldo non basta, non nasce niente: né su Wise né qui.
+    if (opts.requireBalance) await ensureBalance(client, quote.sourceCurrency, quote.sourceAmount);
+
     let row = existing;
     if (!row) {
         const ins = await pool.query(
@@ -264,6 +267,21 @@ async function prepare(pool, client, companyId, input, limits = {}) {
     return up.rows[0];
 }
 
+function fmtMoney(value, currency) {
+    return `${Number(value).toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
+}
+
+// Prima di far partire dei soldi: nel saldo da cui si paga ce n'è abbastanza? Se no, si ferma qui,
+// con la cifra che serve e quella che c'è. Se il saldo non si riesce a leggere, non si procede.
+async function ensureBalance(client, currency, needed) {
+    const balances = await client.balances();
+    const found = balances.find(b => b.currency === currency);
+    const have = found ? Number(found.amount) : 0;
+    if (have + 0.000001 < Number(needed)) {
+        throw new wise.WiseError(`Il saldo Wise non basta: per questo bonifico servono ${fmtMoney(needed, currency)}, nel saldo ${currency} ci sono ${fmtMoney(have, currency)}.`, 422);
+    }
+}
+
 // FA PARTIRE un bonifico preparato: lo paga dal saldo Wise. Da chiamare solo dopo aver controllato il PIN.
 // Il passaggio da «in attesa» a «in invio» è una sola UPDATE condizionata: due richieste insieme
 // (doppio tocco, riprova) non possono pagare due volte, perché solo una trova la riga ancora in attesa.
@@ -275,6 +293,9 @@ async function send(pool, client, companyId, paymentId, limits = {}) {
     if (limits.maxAmount && Number(row.target_amount) > limits.maxAmount) {
         throw new wise.WiseError(`Importo sopra il tetto di sicurezza (${limits.maxAmount} per bonifico). Questo bonifico va confermato dall'app di Wise.`, 400);
     }
+    // Il saldo si controlla prima di prenotare l'invio: se non basta, il bonifico resta com'è (in attesa).
+    if (row.source_amount != null && row.source_currency) await ensureBalance(client, row.source_currency, row.source_amount);
+
     const claim = await pool.query(
         `UPDATE wise_payments SET status = 'sending', updated_at = CURRENT_TIMESTAMP
          WHERE id = $1 AND company_id = $2 AND status = 'incoming_payment_waiting' RETURNING *`,
