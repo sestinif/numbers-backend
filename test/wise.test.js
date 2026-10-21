@@ -58,9 +58,9 @@ test('i saldi arrivano puliti: valuta e cifra, i vuoti in fondo', async () => {
     });
     const client = wise.createClient({ token: 't', fetchImpl });
     assert.deepStrictEqual(await client.balances(), [
-        { currency: 'USD', amount: 12480 },
-        { currency: 'EUR', amount: 3210.5 },
-        { currency: 'GBP', amount: 0 },
+        { id: 2, currency: 'USD', amount: 12480 },
+        { id: 3, currency: 'EUR', amount: 3210.5 },
+        { id: 1, currency: 'GBP', amount: 0 },
     ]);
     assert.ok(calls[1].url.includes('types=STANDARD'));
 });
@@ -229,4 +229,39 @@ test('la spesa nasce solo quando i soldi sono partiti davvero', () => {
     assert.strictEqual(wise.shouldTrackExpense({ track_expense: true, expense_id: 7, status: 'outgoing_payment_sent' }), false);
     assert.strictEqual(wise.shouldTrackExpense({ track_expense: false, expense_id: null, status: 'outgoing_payment_sent' }), false);
     assert.strictEqual(wise.shouldTrackExpense({ track_expense: true, expense_id: null, status: 'cancelled' }), false);
+});
+
+test('l\'estratto di un saldo: percorso, periodo e solo le righe che servono', async () => {
+    const { fetchImpl, calls } = fakeWise({
+        'GET /v2/profiles': PROFILES,
+        'GET /v1/profiles/22/balance-statements/3/statement.json': {
+            transactions: [
+                { type: 'DEBIT', date: '2026-11-03T09:00:00.000Z', amount: { value: -300, currency: 'EUR' }, details: { type: 'TRANSFER', description: 'Sent money to Federico Sestini' }, referenceNumber: 'TRANSFER-1234567' },
+                { type: 'DEBIT', date: '2026-11-04T09:00:00.000Z', amount: { value: -9.9, currency: 'EUR' }, details: { type: 'CARD', description: 'Card transaction' }, referenceNumber: 'CARD-55' },
+                { type: 'CREDIT', date: '2026-11-05T09:00:00.000Z', amount: { value: 500, currency: 'EUR' }, details: { type: 'DEPOSIT' }, referenceNumber: 'TRANSFER-777' },
+                { type: 'DEBIT', date: '2026-11-06T09:00:00.000Z', amount: { value: -50, currency: 'EUR' }, details: { type: 'CONVERSION' }, referenceNumber: 'CONVERSION-9' },
+            ],
+        },
+    });
+    const client = wise.createClient({ token: 't', fetchImpl });
+    const lines = await client.statement(3, 'EUR', '2026-11-01T00:00:00.000Z', '2026-11-30T23:59:59.999Z');
+    const url = new URL(calls[1].url);
+    assert.strictEqual(url.searchParams.get('currency'), 'EUR');
+    assert.strictEqual(url.searchParams.get('intervalStart'), '2026-11-01T00:00:00.000Z');
+    assert.strictEqual(url.searchParams.get('intervalEnd'), '2026-11-30T23:59:59.999Z');
+    assert.strictEqual(url.searchParams.get('type'), 'COMPACT');
+    assert.deepStrictEqual(lines, [{ date: '2026-11-03T09:00:00.000Z', transferId: 1234567, amount: 300, currency: 'EUR' }],
+        'solo i bonifici in uscita: niente carta, entrate, cambi');
+});
+
+test('se Wise chiede l\'autenticazione forte per l\'estratto, l\'errore lo spiega', async () => {
+    const { fetchImpl } = fakeWise({ 'GET /v2/profiles': PROFILES, 'GET /v1/profiles/22/balance-statements/3/statement.json': { __status: 403, body: {} } });
+    await assert.rejects(() => wise.createClient({ token: 'tok-segreto', fetchImpl }).statement(3, 'EUR', 'a', 'b'),
+        e => /estratto/i.test(e.message) && e.status === 502 && !e.message.includes('tok-segreto'));
+});
+
+test('il modulo non legge mai la posta... né muove soldi leggendo l\'estratto: solo GET', async () => {
+    const { fetchImpl, calls } = fakeWise({ 'GET /v2/profiles': PROFILES, 'GET /v1/profiles/22/balance-statements/3/statement.json': { transactions: [] } });
+    await wise.createClient({ token: 't', fetchImpl }).statement(3, 'EUR', 'a', 'b');
+    assert.ok(calls.every(c => c.key.startsWith('GET ')));
 });

@@ -113,6 +113,12 @@ const FUND_REJECTIONS = {
     'transfer.not-found': 'Wise non trova questo bonifico.',
 };
 
+// «TRANSFER-1234567» → 1234567. Le righe dell'estratto che non sono bonifici danno null.
+function transferIdFromReference(ref) {
+    const m = /^TRANSFER-(\d+)$/.exec(String(ref == null ? '' : ref));
+    return m ? Number(m[1]) : null;
+}
+
 function positiveAmount(value) {
     const n = typeof value === 'number' ? value : parseFloat(value);
     return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null;
@@ -165,8 +171,34 @@ function createClient({ token, baseUrl, profileId, fetchImpl } = {}) {
         const id = await getProfileId();
         const rows = await request('GET', `/v4/profiles/${id}/balances?types=STANDARD`);
         return (rows || [])
-            .map(b => ({ currency: b.currency, amount: Number((b.amount && b.amount.value) || 0) }))
+            .map(b => ({ id: b.id, currency: b.currency, amount: Number((b.amount && b.amount.value) || 0) }))
             .sort((a, b) => (b.amount > 0) - (a.amount > 0) || b.amount - a.amount);
+    }
+
+    // L'estratto di un saldo, ridotto ai soli bonifici in uscita: [{ date, transferId, amount, currency }].
+    // Sola lettura. Fuori da USA, Canada, Australia, Nuova Zelanda, Singapore e Malesia Wise chiede
+    // l'autenticazione forte, che un token personale non sa dare: in quel caso errore chiaro (403).
+    async function statement(balanceId, currency, intervalStart, intervalEnd) {
+        const profile = await getProfileId();
+        const qs = new URLSearchParams({ currency, intervalStart, intervalEnd, type: 'COMPACT' }).toString();
+        let data;
+        try {
+            data = await request('GET', `/v1/profiles/${profile}/balance-statements/${Number(balanceId)}/statement.json?${qs}`);
+        } catch (e) {
+            if (e instanceof WiseError && e.status === 403) {
+                throw new WiseError('Wise non lascia leggere l\'estratto del conto da Numbers (per questo conto serve l\'autenticazione forte, che un token personale non può dare).', 502);
+            }
+            throw e;
+        }
+        return ((data && data.transactions) || [])
+            .filter(t => t.type === 'DEBIT' && t.details && t.details.type === 'TRANSFER')
+            .map(t => ({
+                date: t.date,
+                transferId: transferIdFromReference(t.referenceNumber),
+                amount: Math.abs(Number(t.amount && t.amount.value) || 0),
+                currency: t.amount && t.amount.currency,
+            }))
+            .filter(t => t.transferId);
     }
 
     async function recipients() {
@@ -272,7 +304,7 @@ function createClient({ token, baseUrl, profileId, fetchImpl } = {}) {
         return request('PUT', `/v1/transfers/${Number(transferId)}/cancel`);
     }
 
-    return { profileId: getProfileId, balances, recipients, createIbanRecipient, quote, createTransfer, fundTransfer, getTransfer, cancelTransfer };
+    return { profileId: getProfileId, balances, statement, recipients, createIbanRecipient, quote, createTransfer, fundTransfer, getTransfer, cancelTransfer };
 }
 
 function clientFromEnv(env) {
@@ -285,5 +317,5 @@ function clientFromEnv(env) {
 
 module.exports = {
     WiseError, isConfigured, createClient, clientFromEnv,
-    statusInfo, shouldTrackExpense, validIban, cleanIban, maskAccount, summarizeRecipient, positiveAmount,
+    statusInfo, shouldTrackExpense, transferIdFromReference, validIban, cleanIban, maskAccount, summarizeRecipient, positiveAmount,
 };

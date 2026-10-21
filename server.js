@@ -17,6 +17,7 @@ const accessCode = require('./access-code');
 const gmail = require('./gmail');
 const mailLog = require('./mail-log');
 const wisePayments = require('./wise-payments');
+const withdrawals = require('./withdrawals');
 const payPin = require('./pay-pin');
 
 // Multer: memory storage, 5MB max, only images/pdf
@@ -1554,7 +1555,8 @@ app.get('/api/companies/:companyId/wise', authenticateToken, async (req, res) =>
         const [balances, recipients] = await Promise.all([client.balances(), client.recipients()]);
         const changed = await wisePayments.refresh(pool, client, companyId, aiCosts.toEurRate);
         const labels = await wisePayments.getLabels(pool, companyId);
-        const named = recipients.map(r => ({ ...r, label: labels[String(r.id)] || null }));
+        const shares = await wisePayments.getShares(pool, companyId);
+        const named = recipients.map(r => ({ ...r, label: labels[String(r.id)] || null, withdrawal: shares[String(r.id)] || 'none' }));
         const payments = (await wisePayments.listPayments(pool, companyId)).map(row => wisePayments.publicPayment(row, labels));
         res.json({ configured: true, directSend: payPin.isEnabled(process.env), balances, recipients: named, payments, changed });
     } catch (error) {
@@ -1655,10 +1657,52 @@ app.put('/api/companies/:companyId/wise/recipient-labels', authenticateToken, as
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
         const saved = await wisePayments.saveLabels(pool, companyId, req.body && req.body.labels);
-        res.json({ saved, labels: await wisePayments.getLabels(pool, companyId) });
+        res.json({ saved, labels: await wisePayments.getLabels(pool, companyId), shares: await wisePayments.getShares(pool, companyId) });
     } catch (error) {
         console.error('Errore nomi beneficiari:', error.message);
         res.status(500).json({ error: 'Errore nel salvataggio dei nomi' });
+    }
+});
+
+// ===== Prelievi (letti da Personals) =====
+// Quanto è uscito dal conto Wise verso i conti personali nel mese, con le quote scelte in «Nomi beneficiari».
+// Sola lettura, protetta da una chiave sua (NUMBERS_EXPORT_KEY), non dal login: chi la chiama è il server di Personals.
+const WITHDRAWALS_SYNC_EVERY_MS = 10 * 60 * 1000;
+const withdrawalsSync = { at: 0, running: null, result: null };
+
+async function exportCompanyId() {
+    const fixed = parseInt(process.env.NUMBERS_EXPORT_COMPANY_ID, 10);
+    if (fixed > 0) return fixed;
+    const r = await pool.query(`SELECT company_id FROM wise_recipient_labels WHERE withdrawal_share IS NOT NULL ORDER BY updated_at DESC LIMIT 1`);
+    return r.rows[0] ? r.rows[0].company_id : null;
+}
+
+// Legge l'estratto di Wise al massimo ogni 10 minuti; chi arriva in mezzo trova l'esito dell'ultima lettura.
+async function syncWithdrawals(companyId) {
+    if (!wise.isConfigured(process.env)) return { added: 0, error: 'Wise non è collegato a Numbers.' };
+    if (withdrawalsSync.running) return withdrawalsSync.running;
+    if (withdrawalsSync.result && Date.now() - withdrawalsSync.at < WITHDRAWALS_SYNC_EVERY_MS) return withdrawalsSync.result;
+    withdrawalsSync.running = withdrawals.syncFromStatement(pool, wise.clientFromEnv(process.env), companyId, aiCosts.toEurRate)
+        .then(result => { withdrawalsSync.result = result; withdrawalsSync.at = Date.now(); return result; })
+        .finally(() => { withdrawalsSync.running = null; });
+    return withdrawalsSync.running;
+}
+
+app.get('/api/export/withdrawals', async (req, res) => {
+    if (!withdrawals.exportEnabled(process.env)) return res.status(404).json({ error: 'Non trovato' });
+    if (!withdrawals.keyMatches(req.get('x-api-key'), process.env)) return res.status(400).json({ error: 'Chiave non valida.' });
+    try {
+        const month = req.query.month == null ? withdrawals.currentMonth() : String(req.query.month);
+        if (!withdrawals.isMonth(month)) return res.status(400).json({ error: 'Mese non valido (AAAA-MM).' });
+        const companyId = await exportCompanyId();
+        if (!companyId) return res.json({ ...withdrawals.summarize([], month), start_month: withdrawals.START_MONTH, sync: { error: 'In Numbers non è ancora stato scelto nessun beneficiario che conta nei prelievi.' }, not_counted: { count: 0, total_eur: 0 } });
+        const sync = await syncWithdrawals(companyId);
+        const summary = await withdrawals.monthSummary(pool, companyId, month);
+        const not_counted = withdrawals.monthInScope(month) ? await withdrawals.monthNotCounted(pool, companyId, month) : { count: 0, total_eur: 0 };
+        res.json({ ...summary, start_month: withdrawals.START_MONTH, sync: { added: sync.added || 0, error: sync.error || null }, not_counted });
+    } catch (error) {
+        console.error('Errore export prelievi:', error.message);
+        res.status(500).json({ error: 'Errore nel calcolo dei prelievi' });
     }
 });
 
@@ -1922,6 +1966,12 @@ async function runMigrations() {
         await mailLog.ensureTable(pool);
         results.push('M14: customers.email e sent_emails ✅');
     } catch (e) { results.push('M14 skipped: ' + e.message); }
+
+    // Migration 15: bonifici in uscita (per i prelievi di Personals) e quota prelievo dei beneficiari.
+    try {
+        await withdrawals.ensureTables(pool);
+        results.push('M15: wise_outgoing e quota prelievo ✅');
+    } catch (e) { results.push('M15 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;

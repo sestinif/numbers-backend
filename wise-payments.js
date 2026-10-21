@@ -7,6 +7,7 @@
 // Numbers con send() qui sotto. send() è chiamata SOLO dalla rotta protetta dal PIN (server.js).
 
 const wise = require('./wise');
+const withdrawals = require('./withdrawals');
 
 const REFRESH_LIMIT = 25; // quanti bonifici non chiusi si ricontrollano a ogni apertura della pagina
 
@@ -55,28 +56,47 @@ function cleanLabel(value) {
     return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, 60);
 }
 
-// { '<id beneficiario>': 'nome dato in Numbers' }
+// { '<id beneficiario>': 'nome dato in Numbers' } (i beneficiari senza nome, con solo la quota prelievo, non ci sono)
 async function getLabels(pool, companyId) {
     const r = await pool.query(`SELECT recipient_id, label FROM wise_recipient_labels WHERE company_id = $1`, [companyId]);
     const out = {};
-    for (const row of r.rows) out[String(row.recipient_id)] = row.label;
+    for (const row of r.rows) if (row.label) out[String(row.recipient_id)] = row.label;
     return out;
 }
 
-// list = [{ recipientId, label }]. Un nome vuoto toglie quello che c'era.
+// { '<id beneficiario>': 'all' | 'half' } — chi non c'è, non conta nei prelievi.
+async function getShares(pool, companyId) {
+    const r = await pool.query(
+        `SELECT recipient_id, withdrawal_share FROM wise_recipient_labels WHERE company_id = $1 AND withdrawal_share IS NOT NULL`,
+        [companyId]
+    );
+    const out = {};
+    for (const row of r.rows) out[String(row.recipient_id)] = withdrawals.shareName(Number(row.withdrawal_share));
+    return out;
+}
+
+// list = [{ recipientId, label, share? }]. Nome vuoto e nessuna quota toglie la riga.
+// `share` ('all' | 'half' | 'none') è la quota che conta nei prelievi; se manca, resta quella che c'era.
 async function saveLabels(pool, companyId, list) {
     let saved = 0;
     for (const item of Array.isArray(list) ? list.slice(0, 500) : []) {
         const id = String(item && item.recipientId != null ? item.recipientId : '').trim();
         if (!/^\d{1,18}$/.test(id)) continue;
         const label = cleanLabel(item.label);
-        if (!label) {
+        const hasShare = Object.prototype.hasOwnProperty.call(item, 'share');
+        const share = hasShare ? withdrawals.shareFrom(item.share) : undefined;
+        const current = (await pool.query(
+            `SELECT withdrawal_share FROM wise_recipient_labels WHERE company_id = $1 AND recipient_id = $2`, [companyId, id]
+        )).rows[0];
+        const finalShare = hasShare ? share : (current && current.withdrawal_share != null ? Number(current.withdrawal_share) : null);
+        if (!label && finalShare == null) {
             await pool.query(`DELETE FROM wise_recipient_labels WHERE company_id = $1 AND recipient_id = $2`, [companyId, id]);
         } else {
             await pool.query(
-                `INSERT INTO wise_recipient_labels (company_id, recipient_id, label) VALUES ($1, $2, $3)
-                 ON CONFLICT (company_id, recipient_id) DO UPDATE SET label = EXCLUDED.label, updated_at = CURRENT_TIMESTAMP`,
-                [companyId, id, label]
+                `INSERT INTO wise_recipient_labels (company_id, recipient_id, label, withdrawal_share) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (company_id, recipient_id) DO UPDATE
+                 SET label = EXCLUDED.label, withdrawal_share = EXCLUDED.withdrawal_share, updated_at = CURRENT_TIMESTAMP`,
+                [companyId, id, label, finalShare]
             );
         }
         saved++;
@@ -177,6 +197,7 @@ async function refresh(pool, client, companyId, toEurRate, now = new Date()) {
                     );
                     current = up.rows[0];
                     changed++;
+                    if (row.status === 'incoming_payment_waiting') await recordIfPaid(pool, current, toEurRate, now);
                 }
             }
             if (TRACK_EXPENSES && wise.shouldTrackExpense(current)) {
@@ -282,6 +303,18 @@ async function ensureBalance(client, currency, needed) {
     }
 }
 
+// Un bonifico che ha lasciato «in attesa» e non è finito male entra nei prelievi del mese.
+// Mai un errore verso chi chiama: se qui qualcosa va storto, il conto lo recupera l'estratto di Wise.
+const NOT_PAID = new Set(['incoming_payment_waiting', 'sending', 'cancelled', 'funds_refunded', 'charged_back']);
+async function recordIfPaid(pool, row, toEurRate, now) {
+    if (!row || !row.wise_transfer_id || NOT_PAID.has(row.status)) return;
+    try {
+        await withdrawals.recordPaid(pool, row, toEurRate || require('./ai-costs').toEurRate, now);
+    } catch (e) {
+        console.error(`Prelievi: bonifico ${row.wise_transfer_id} non registrato:`, e.message);
+    }
+}
+
 // FA PARTIRE un bonifico preparato: lo paga dal saldo Wise. Da chiamare solo dopo aver controllato il PIN.
 // Il passaggio da «in attesa» a «in invio» è una sola UPDATE condizionata: due richieste insieme
 // (doppio tocco, riprova) non possono pagare due volte, perché solo una trova la riga ancora in attesa.
@@ -325,6 +358,7 @@ async function send(pool, client, companyId, paymentId, limits = {}) {
         `UPDATE wise_payments SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`,
         [status, paymentId]
     );
+    await recordIfPaid(pool, up.rows[0], null, new Date());
     return { row: up.rows[0], already: !!(outcome && outcome.already) };
 }
 
@@ -341,4 +375,4 @@ async function cancel(pool, client, companyId, paymentId) {
     return up.rows[0];
 }
 
-module.exports = { TRACK_EXPENSES, ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, send, cancel, getLabels, saveLabels, cleanLabel };
+module.exports = { TRACK_EXPENSES, ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, send, cancel, getLabels, getShares, saveLabels, cleanLabel };
