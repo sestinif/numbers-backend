@@ -233,6 +233,19 @@ async function allItems(pool, companyId) {
     });
 }
 
+// Totale che conta di ogni mese con almeno un prelievo: [{ month: '2026-11', total_eur }], dal più vecchio.
+async function monthTotals(pool, companyId) {
+    const r = await pool.query(
+        `SELECT to_char(o.transfer_date, 'YYYY-MM') AS month, SUM(o.amount_eur * l.withdrawal_share) AS total
+         FROM wise_outgoing o
+         JOIN wise_recipient_labels l ON l.company_id = o.company_id AND l.recipient_id = o.recipient_id
+         WHERE o.company_id = $1 AND o.transfer_date >= $2 AND l.withdrawal_share IS NOT NULL
+         GROUP BY 1 ORDER BY 1`,
+        [companyId, START_DATE]
+    );
+    return r.rows.map(row => ({ month: row.month, total_eur: Math.round(Number(row.total) * 100) / 100 }));
+}
+
 async function monthSummary(pool, companyId, month) {
     if (!monthInScope(month)) return summarize([], month);
     return summarize(await monthItems(pool, companyId, month), month);
@@ -242,5 +255,5 @@ module.exports = {
     START_DATE, START_MONTH, MIN_KEY_LENGTH,
     dayInRome, isInScope, isMonth, monthInScope, currentMonth, shareFrom, shareName,
     transferIdFromReference, counted, summarize, exportEnabled, keyMatches,
-    ensureTables, recordOutgoing, recordPaid, syncFromStatement, monthItems, monthNotCounted, allItems, monthSummary,
+    ensureTables, recordOutgoing, recordPaid, syncFromStatement, monthItems, monthNotCounted, allItems, monthTotals, monthSummary,
 };
