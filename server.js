@@ -1695,11 +1695,11 @@ app.get('/api/export/withdrawals', async (req, res) => {
         const month = req.query.month == null ? withdrawals.currentMonth() : String(req.query.month);
         if (!withdrawals.isMonth(month)) return res.status(400).json({ error: 'Mese non valido (AAAA-MM).' });
         const companyId = await exportCompanyId();
-        if (!companyId) return res.json({ ...withdrawals.summarize([], month), start_month: withdrawals.START_MONTH, sync: { error: 'In Numbers non è ancora stato scelto nessun beneficiario che conta nei prelievi.' }, not_counted: { count: 0, total_eur: 0 } });
+        if (!companyId) return res.json({ ...withdrawals.summarize([], month), start_month: withdrawals.START_MONTH, current_month: withdrawals.currentMonth(), sync: { error: 'In Numbers non è ancora stato scelto nessun beneficiario che conta nei prelievi.' }, not_counted: { count: 0, total_eur: 0 } });
         const sync = await syncWithdrawals(companyId);
         const summary = await withdrawals.monthSummary(pool, companyId, month);
         const not_counted = withdrawals.monthInScope(month) ? await withdrawals.monthNotCounted(pool, companyId, month) : { count: 0, total_eur: 0 };
-        res.json({ ...summary, start_month: withdrawals.START_MONTH, sync: { added: sync.added || 0, error: sync.error || null }, not_counted });
+        res.json({ ...summary, start_month: withdrawals.START_MONTH, current_month: withdrawals.currentMonth(), sync: { added: sync.added || 0, error: sync.error || null }, not_counted });
     } catch (error) {
         console.error('Errore export prelievi:', error.message);
         res.status(500).json({ error: 'Errore nel calcolo dei prelievi' });
