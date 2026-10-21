@@ -152,6 +152,8 @@ async function recordPaid(pool, row, toEurRate, now = new Date()) {
 // Ritorna { added, error }: se Wise non lascia leggere l'estratto, error dice perché e non si rompe niente.
 async function syncFromStatement(pool, client, companyId, toEurRate, now = new Date()) {
     const out = { added: 0, error: null };
+    // Prima del 1 novembre non c'è niente da leggere (e Wise rifiuterebbe un periodo che parte nel futuro).
+    if (!isInScope(dayInRome(now))) return out;
     try {
         const known = new Set((await pool.query(`SELECT transfer_id FROM wise_outgoing WHERE company_id = $1`, [companyId])).rows.map(r => String(r.transfer_id)));
         const names = new Map((await client.recipients()).map(r => [String(r.id), r.name]));
