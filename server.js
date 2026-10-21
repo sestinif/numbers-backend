@@ -1706,6 +1706,42 @@ app.get('/api/export/withdrawals', async (req, res) => {
     }
 });
 
+// Cambia conto a spese e ricorrenti in blocco (es. «tutto su Wise»). Vale anche per lo storico.
+// Body: { to, from } oppure { to, all: true }. Senza `from` si spostano quelle senza conto.
+app.post('/api/companies/:companyId/accounts/move', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        const plan = recurring.planAccountMove(req.body);
+        if (plan.error) return res.status(400).json({ error: plan.error });
+        const where = recurring.accountMoveWhere(plan.from, 3);
+        const args = [companyId, plan.to, ...where.params];
+        const sql = table => `UPDATE ${table} SET account = $2, updated_at = CURRENT_TIMESTAMP
+                              WHERE company_id = $1 AND ${where.sql} AND account IS DISTINCT FROM $2`;
+        const exp = await pool.query(sql('expenses'), args);
+        const rules = await pool.query(sql('recurring_rules'), args);
+        res.json({ expenses: exp.rowCount, rules: rules.rowCount, to: plan.to });
+    } catch (error) {
+        console.error('Errore cambio conto:', error.message);
+        res.status(500).json({ error: 'Errore nel cambio di conto' });
+    }
+});
+
+// I compensi personali per la Dashboard: i prelievi che contano (con le quote scelte), da novembre 2026.
+// Legge solo dal database; l'estratto di Wise si rilegge in secondo piano (al massimo ogni 10 minuti),
+// così la pagina non aspetta Wise e il numero si aggiorna all'apertura successiva.
+app.get('/api/companies/:companyId/withdrawals', authenticateToken, async (req, res) => {
+    const { companyId } = req.params;
+    try {
+        if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        syncWithdrawals(companyId).catch(e => console.error('Prelievi: lettura estratto:', e.message));
+        res.json({ start_month: withdrawals.START_MONTH, items: await withdrawals.allItems(pool, companyId) });
+    } catch (error) {
+        console.error('Errore compensi:', error.message);
+        res.status(500).json({ error: 'Errore nel calcolo dei compensi' });
+    }
+});
+
 // Beneficiario nuovo in euro, con IBAN. Gli altri tipi di conto si aggiungono da Wise.
 app.post('/api/companies/:companyId/wise/recipients', authenticateToken, async (req, res) => {
     const { companyId } = req.params;

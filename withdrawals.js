@@ -217,6 +217,22 @@ async function monthNotCounted(pool, companyId, month) {
     return { count: r.rows[0].n, total_eur: Math.round(Number(r.rows[0].total) * 100) / 100 };
 }
 
+// Tutti i prelievi che contano, da novembre 2026 in poi: li usa la Dashboard di Numbers per i «compensi personali».
+async function allItems(pool, companyId) {
+    const r = await pool.query(
+        `SELECT to_char(o.transfer_date, 'YYYY-MM-DD') AS date, o.transfer_id, o.recipient_name, o.amount_eur, l.label, l.withdrawal_share AS share
+         FROM wise_outgoing o
+         JOIN wise_recipient_labels l ON l.company_id = o.company_id AND l.recipient_id = o.recipient_id
+         WHERE o.company_id = $1 AND o.transfer_date >= $2 AND l.withdrawal_share IS NOT NULL
+         ORDER BY o.transfer_date DESC, o.transfer_id DESC`,
+        [companyId, START_DATE]
+    );
+    return r.rows.map(row => {
+        const item = { date: row.date, transfer_id: String(row.transfer_id), name: row.label || row.recipient_name || '', amount_eur: Number(row.amount_eur), share: Number(row.share) };
+        return { ...item, counted_eur: counted(item.amount_eur, item.share) };
+    });
+}
+
 async function monthSummary(pool, companyId, month) {
     if (!monthInScope(month)) return summarize([], month);
     return summarize(await monthItems(pool, companyId, month), month);
@@ -226,5 +242,5 @@ module.exports = {
     START_DATE, START_MONTH, MIN_KEY_LENGTH,
     dayInRome, isInScope, isMonth, monthInScope, currentMonth, shareFrom, shareName,
     transferIdFromReference, counted, summarize, exportEnabled, keyMatches,
-    ensureTables, recordOutgoing, recordPaid, syncFromStatement, monthItems, monthNotCounted, monthSummary,
+    ensureTables, recordOutgoing, recordPaid, syncFromStatement, monthItems, monthNotCounted, allItems, monthSummary,
 };

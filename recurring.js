@@ -55,6 +55,25 @@ function cleanAccount(value) {
     return v || null;
 }
 
+// Cambio di conto in blocco: da quale conto (uno, «tutti», o «nessuno» = senza conto) a quale.
+// Ritorna { error } o { from: { mode: 'all' | 'none' | 'name', name }, to }.
+function planAccountMove(body) {
+    const to = cleanAccount(body && body.to);
+    if (!to) return { error: 'Scrivi su quale conto spostare.' };
+    if (body && body.all === true) return { from: { mode: 'all', name: null }, to };
+    const name = cleanAccount(body && body.from);
+    if (!name) return { from: { mode: 'none', name: null }, to };
+    if (name.toLowerCase() === to.toLowerCase()) return { error: 'Il conto di partenza e quello di arrivo sono lo stesso.' };
+    return { from: { mode: 'name', name }, to };
+}
+
+// Dove si applica il cambio: condizione SQL (sulla colonna account) e parametri extra.
+function accountMoveWhere(from, firstParam) {
+    if (from.mode === 'all') return { sql: 'TRUE', params: [] };
+    if (from.mode === 'none') return { sql: `(account IS NULL OR TRIM(account) = '')`, params: [] };
+    return { sql: `LOWER(TRIM(account)) = LOWER($${firstParam})`, params: [from.name] };
+}
+
 function isoDate(year, month, day) {
     return `${ym(year, month)}-${String(clampDay(year, month, day)).padStart(2, '0')}`;
 }
@@ -112,4 +131,4 @@ async function afterExpenseSaved(pool, expense) {
     return { confirmed: true };
 }
 
-module.exports = { materialize, afterExpenseSaved, normalizeCostType, cleanAccount, currentPeriod, ym, clampDay };
+module.exports = { materialize, afterExpenseSaved, normalizeCostType, cleanAccount, planAccountMove, accountMoveWhere, currentPeriod, ym, clampDay };

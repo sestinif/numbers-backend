@@ -83,3 +83,17 @@ test('le voci fisse, manuali e delle API non vengono toccate', async () => {
         assert.strictEqual(pool.calls.length, 0);
     }
 });
+
+test('cambio conto in blocco: scelta di da/a, e cosa dice la condizione SQL', () => {
+    assert.deepStrictEqual(R.planAccountMove({ to: ' Wise ', from: 'Revolut Business' }), { from: { mode: 'name', name: 'Revolut Business' }, to: 'Wise' });
+    assert.deepStrictEqual(R.planAccountMove({ to: 'Wise', all: true }), { from: { mode: 'all', name: null }, to: 'Wise' });
+    assert.deepStrictEqual(R.planAccountMove({ to: 'Wise', from: '' }), { from: { mode: 'none', name: null }, to: 'Wise' });
+    assert.ok(R.planAccountMove({ from: 'Revolut' }).error, 'senza conto di arrivo non si sposta niente');
+    assert.ok(R.planAccountMove({ to: '  ', all: true }).error);
+    assert.ok(R.planAccountMove({ to: 'wise', from: 'Wise ' }).error, 'stesso conto, anche con maiuscole e spazi');
+    assert.strictEqual(R.planAccountMove({ to: 'Wise', all: 'true' }).from.mode, 'none', 'all vale solo se è proprio true');
+
+    assert.deepStrictEqual(R.accountMoveWhere({ mode: 'all' }, 3), { sql: 'TRUE', params: [] });
+    assert.deepStrictEqual(R.accountMoveWhere({ mode: 'name', name: 'Revolut Business' }, 3), { sql: 'LOWER(TRIM(account)) = LOWER($3)', params: ['Revolut Business'] });
+    assert.match(R.accountMoveWhere({ mode: 'none' }, 3).sql, /IS NULL/);
+});
