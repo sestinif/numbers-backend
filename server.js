@@ -15,6 +15,7 @@ const recurring = require('./recurring');
 const wise = require('./wise');
 const accessCode = require('./access-code');
 const gmail = require('./gmail');
+const inbox = require('./inbox');
 const mailLog = require('./mail-log');
 const wisePayments = require('./wise-payments');
 const withdrawals = require('./withdrawals');
@@ -1776,6 +1777,77 @@ function mailDailyLimit() {
     const n = parseInt(process.env.GMAIL_MAX_PER_DAY, 10);
     return Number.isFinite(n) && n > 0 ? n : 50;
 }
+
+// ===== Casella email in sola lettura (una sola azienda, vedi inbox.js) =====
+// Mai 401/403: la pagina esce dall'accesso su quei codici. Le altre aziende ricevono «non attiva».
+const inboxLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    message: { error: 'Troppe richieste alla casella. Riprova tra un minuto.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+async function inboxGuard(req, res) {
+    const { companyId } = req.params;
+    if (!(await ownCompany(companyId, req.user.id))) { res.status(404).json({ error: 'Azienda non trovata' }); return null; }
+    if (!inbox.isEnabledFor(process.env, companyId)) { res.status(404).json({ error: 'La casella non è attiva per questa azienda' }); return null; }
+    res.set('Cache-Control', 'no-store');
+    return inbox.config(process.env);
+}
+
+function inboxFail(res, error, fallback) {
+    const e = inbox.describeError(error);
+    if (e.status >= 500 || e.message === 'Non riesco a leggere la casella in questo momento.') console.error(`${fallback}:`, error && error.message);
+    res.status(e.status).json({ error: e.message });
+}
+
+app.get('/api/companies/:companyId/inbox', authenticateToken, async (req, res) => {
+    try {
+        if (!(await ownCompany(req.params.companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        const enabled = inbox.isEnabledFor(process.env, req.params.companyId);
+        const cfg = enabled ? inbox.config(process.env) : null;
+        res.json({ enabled, address: cfg ? cfg.user : null });
+    } catch (error) {
+        console.error('Errore stato casella:', error.message);
+        res.status(500).json({ error: 'Errore nel controllo della casella' });
+    }
+});
+
+app.get('/api/companies/:companyId/inbox/folders', authenticateToken, inboxLimiter, async (req, res) => {
+    try {
+        const cfg = await inboxGuard(req, res);
+        if (!cfg) return;
+        res.json({ folders: await inbox.listFolders(cfg) });
+    } catch (error) {
+        inboxFail(res, error, 'Errore cartelle casella');
+    }
+});
+
+app.get('/api/companies/:companyId/inbox/messages', authenticateToken, inboxLimiter, async (req, res) => {
+    try {
+        const cfg = await inboxGuard(req, res);
+        if (!cfg) return;
+        const folder = inbox.cleanFolder(req.query.folder);
+        if (!folder) return res.status(400).json({ error: 'Cartella non valida' });
+        res.json(await inbox.listMessages(cfg, folder, inbox.cleanPage(req.query.page)));
+    } catch (error) {
+        inboxFail(res, error, 'Errore elenco email');
+    }
+});
+
+app.get('/api/companies/:companyId/inbox/messages/:uid', authenticateToken, inboxLimiter, async (req, res) => {
+    try {
+        const cfg = await inboxGuard(req, res);
+        if (!cfg) return;
+        const folder = inbox.cleanFolder(req.query.folder);
+        const uid = inbox.cleanUid(req.params.uid);
+        if (!folder || !uid) return res.status(400).json({ error: 'Richiesta non valida' });
+        res.json(await inbox.getMessage(cfg, folder, uid, { showImages: req.query.images === '1' }));
+    } catch (error) {
+        inboxFail(res, error, 'Errore lettura email');
+    }
+});
 
 // Stato del collegamento e registro delle email partite.
 app.get('/api/companies/:companyId/email', authenticateToken, async (req, res) => {
