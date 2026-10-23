@@ -278,3 +278,15 @@ test('Wise appartiene a una sola azienda: le altre non la vedono', () => {
     assert.strictEqual(wp.wiseCompanyAllowed(undefined, null, 14), true, 'collegamento nuovo: nessuna restrizione');
     assert.strictEqual(wp.wiseCompanyAllowed('', null, 14), true);
 });
+
+test('ogni azienda ha il suo Wise: il suo token, oppure il generale solo se è la sua', () => {
+    const env = { WISE_API_TOKEN: 'generale', WISE_API_TOKEN_14: ' token-oakstone ', WISE_PROFILE_ID_14: '555', WISE_API_BASE: 'https://api.wise.com' };
+    const own = wise.envForCompany(env, 14, false);
+    assert.deepStrictEqual(own, { WISE_API_TOKEN: 'token-oakstone', WISE_API_BASE: 'https://api.wise.com', WISE_PROFILE_ID: '555' });
+    assert.strictEqual(wise.envForCompany(env, 14, true).WISE_API_TOKEN, 'token-oakstone', 'il token dell\'azienda vince sul generale');
+    assert.strictEqual(wise.envForCompany(env, 13, true).WISE_API_TOKEN, 'generale', 'l\'azienda del token generale usa quello');
+    assert.strictEqual(wise.envForCompany(env, 13, false), null, 'un\'altra azienda senza token suo non vede niente');
+    assert.strictEqual(wise.envForCompany({}, 13, true), null, 'senza nessun token: non collegato');
+    assert.strictEqual(wise.envForCompany({ WISE_API_TOKEN_14: '   ' }, 14, false), null);
+    assert.strictEqual(wise.envForCompany(env, '14; DROP', false).WISE_API_TOKEN, 'token-oakstone', 'dell\'id si leggono solo le cifre');
+});

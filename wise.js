@@ -307,6 +307,21 @@ function createClient({ token, baseUrl, profileId, fetchImpl } = {}) {
     return { profileId: getProfileId, balances, statement, recipients, createIbanRecipient, quote, createTransfer, fundTransfer, getTransfer, cancelTransfer };
 }
 
+// Il collegamento Wise di UNA azienda. Ogni azienda può avere il suo token (WISE_API_TOKEN_<id>, e se serve
+// WISE_PROFILE_ID_<id>), cioè i suoi conti; il token «generale» (WISE_API_TOKEN) vale solo per l'azienda a cui
+// appartiene (`usesDefault`). Ritorna le variabili da dare a clientFromEnv, envForCompany, o null se l'azienda non ha Wise.
+function envForCompany(env, companyId, usesDefault) {
+    const id = String(companyId).replace(/\D/g, '');
+    const own = env && typeof env[`WISE_API_TOKEN_${id}`] === 'string' ? env[`WISE_API_TOKEN_${id}`].trim() : '';
+    if (own) {
+        return { WISE_API_TOKEN: own, WISE_API_BASE: env.WISE_API_BASE, WISE_PROFILE_ID: env[`WISE_PROFILE_ID_${id}`] };
+    }
+    if (usesDefault && isConfigured(env)) {
+        return { WISE_API_TOKEN: env.WISE_API_TOKEN.trim(), WISE_API_BASE: env.WISE_API_BASE, WISE_PROFILE_ID: env.WISE_PROFILE_ID };
+    }
+    return null;
+}
+
 function clientFromEnv(env) {
     return createClient({
         token: env.WISE_API_TOKEN.trim(),
@@ -316,6 +331,6 @@ function clientFromEnv(env) {
 }
 
 module.exports = {
-    WiseError, isConfigured, createClient, clientFromEnv,
+    WiseError, isConfigured, createClient, clientFromEnv, envForCompany,
     statusInfo, shouldTrackExpense, transferIdFromReference, validIban, cleanIban, maskAccount, summarizeRecipient, positiveAmount,
 };

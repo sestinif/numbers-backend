@@ -1567,10 +1567,16 @@ async function isWiseCompany(companyId) {
 }
 const NOT_WISE_COMPANY = { error: 'Wise non è collegato a questa azienda' };
 
+// Il collegamento Wise di questa azienda: il suo token (WISE_API_TOKEN_<id>) o, se è l'azienda del token
+// generale, quello. Altrimenti null: i conti di un'altra azienda non si vedono e non si muovono.
+async function wiseEnvFor(companyId) {
+    return wise.envForCompany(process.env, companyId, await isWiseCompany(companyId));
+}
+
 app.get('/api/companies/:companyId/wise/enabled', authenticateToken, async (req, res) => {
     try {
         if (!(await ownCompany(req.params.companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
-        res.json({ enabled: await isWiseCompany(req.params.companyId) });
+        res.json({ enabled: !!(await wiseEnvFor(req.params.companyId)) });
     } catch (error) {
         console.error('Errore stato Wise:', error.message);
         res.status(500).json({ error: 'Errore nel controllo di Wise' });
@@ -1582,9 +1588,9 @@ app.get('/api/companies/:companyId/wise', authenticateToken, async (req, res) =>
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
-        if (!(await isWiseCompany(companyId))) return res.json({ configured: false, otherCompany: true });
-        if (!wise.isConfigured(process.env)) return res.json({ configured: false });
-        const client = wise.clientFromEnv(process.env);
+        const wiseEnv = await wiseEnvFor(companyId);
+        if (!wiseEnv) return res.json({ configured: false, otherCompany: true });
+        const client = wise.clientFromEnv(wiseEnv);
         const [balances, recipients] = await Promise.all([client.balances(), client.recipients()]);
         const changed = await wisePayments.refresh(pool, client, companyId, aiCosts.toEurRate);
         const labels = await wisePayments.getLabels(pool, companyId);
@@ -1602,9 +1608,9 @@ app.post('/api/companies/:companyId/wise/quote', authenticateToken, async (req, 
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
-        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
-        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
-        const client = wise.clientFromEnv(process.env);
+        const wiseEnv = await wiseEnvFor(companyId);
+        if (!wiseEnv) return res.status(400).json(NOT_WISE_COMPANY);
+        const client = wise.clientFromEnv(wiseEnv);
         const recipient = (await client.recipients()).find(r => String(r.id) === String(req.body.recipientId));
         if (!recipient) return res.status(400).json({ error: 'Beneficiario non trovato su Wise.' });
         const quote = await client.quote({
@@ -1626,15 +1632,15 @@ app.post('/api/companies/:companyId/wise/payments', authenticateToken, async (re
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
-        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
-        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
+        const wiseEnv = await wiseEnvFor(companyId);
+        if (!wiseEnv) return res.status(400).json(NOT_WISE_COMPANY);
         const body = req.body || {};
         const sendNow = body.send === true;
         if (sendNow) {
             const refused = checkPayPin(companyId, body.pin);
             if (refused) return res.status(refused.status).json({ error: refused.error });
         }
-        const client = wise.clientFromEnv(process.env);
+        const client = wise.clientFromEnv(wiseEnv);
         const limits = wiseLimits();
         // Con l'invio immediato, se il saldo non basta il bonifico non nasce nemmeno (requireBalance).
         let row = await wisePayments.prepare(pool, client, companyId, body, limits, { requireBalance: sendNow });
@@ -1662,11 +1668,11 @@ app.post('/api/companies/:companyId/wise/payments/:paymentId/send', authenticate
     const { companyId, paymentId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
-        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
-        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
+        const wiseEnv = await wiseEnvFor(companyId);
+        if (!wiseEnv) return res.status(400).json(NOT_WISE_COMPANY);
         const refused = checkPayPin(companyId, (req.body || {}).pin);
         if (refused) return res.status(refused.status).json({ error: refused.error });
-        const sent = await wisePayments.send(pool, wise.clientFromEnv(process.env), companyId, paymentId, wiseLimits());
+        const sent = await wisePayments.send(pool, wise.clientFromEnv(wiseEnv), companyId, paymentId, wiseLimits());
         console.log(`[bonifico] inviato dall'azienda ${companyId}: ${sent.row.id} (Wise ${sent.row.wise_transfer_id})`);
         res.json(wisePayments.publicPayment(sent.row, await wisePayments.getLabels(pool, companyId)));
     } catch (error) {
@@ -1679,9 +1685,9 @@ app.post('/api/companies/:companyId/wise/payments/:paymentId/cancel', authentica
     const { companyId, paymentId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
-        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
-        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
-        const row = await wisePayments.cancel(pool, wise.clientFromEnv(process.env), companyId, paymentId);
+        const wiseEnv = await wiseEnvFor(companyId);
+        if (!wiseEnv) return res.status(400).json(NOT_WISE_COMPANY);
+        const row = await wisePayments.cancel(pool, wise.clientFromEnv(wiseEnv), companyId, paymentId);
         res.json(wisePayments.publicPayment(row));
     } catch (error) {
         wiseFail(res, error, 'Errore nell\'annullamento del bonifico');
@@ -1693,7 +1699,7 @@ app.put('/api/companies/:companyId/wise/recipient-labels', authenticateToken, as
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
-        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
+        if (!(await wiseEnvFor(companyId))) return res.status(400).json(NOT_WISE_COMPANY);
         const saved = await wisePayments.saveLabels(pool, companyId, req.body && req.body.labels);
         res.json({ saved, labels: await wisePayments.getLabels(pool, companyId), shares: await wisePayments.getShares(pool, companyId) });
     } catch (error) {
@@ -1706,7 +1712,7 @@ app.put('/api/companies/:companyId/wise/recipient-labels', authenticateToken, as
 // Quanto è uscito dal conto Wise verso i conti personali nel mese, con le quote scelte in «Nomi beneficiari».
 // Sola lettura, protetta da una chiave sua (NUMBERS_EXPORT_KEY), non dal login: chi la chiama è il server di Personals.
 const WITHDRAWALS_SYNC_EVERY_MS = 10 * 60 * 1000;
-const withdrawalsSync = { at: 0, running: null, result: null };
+const withdrawalsSync = new Map(); // un conteggio per azienda: ognuna ha il suo Wise
 
 async function exportCompanyId() {
     const fixed = parseInt(process.env.NUMBERS_EXPORT_COMPANY_ID, 10);
@@ -1717,13 +1723,16 @@ async function exportCompanyId() {
 
 // Legge l'estratto di Wise al massimo ogni 10 minuti; chi arriva in mezzo trova l'esito dell'ultima lettura.
 async function syncWithdrawals(companyId) {
-    if (!wise.isConfigured(process.env)) return { added: 0, error: 'Wise non è collegato a Numbers.' };
-    if (withdrawalsSync.running) return withdrawalsSync.running;
-    if (withdrawalsSync.result && Date.now() - withdrawalsSync.at < WITHDRAWALS_SYNC_EVERY_MS) return withdrawalsSync.result;
-    withdrawalsSync.running = withdrawals.syncFromStatement(pool, wise.clientFromEnv(process.env), companyId, aiCosts.toEurRate)
-        .then(result => { withdrawalsSync.result = result; withdrawalsSync.at = Date.now(); return result; })
-        .finally(() => { withdrawalsSync.running = null; });
-    return withdrawalsSync.running;
+    const wiseEnv = await wiseEnvFor(companyId);
+    if (!wiseEnv) return { added: 0, error: 'Wise non è collegato a questa azienda.' };
+    const state = withdrawalsSync.get(String(companyId)) || { at: 0, running: null, result: null };
+    withdrawalsSync.set(String(companyId), state);
+    if (state.running) return state.running;
+    if (state.result && Date.now() - state.at < WITHDRAWALS_SYNC_EVERY_MS) return state.result;
+    state.running = withdrawals.syncFromStatement(pool, wise.clientFromEnv(wiseEnv), companyId, aiCosts.toEurRate)
+        .then(result => { state.result = result; state.at = Date.now(); return result; })
+        .finally(() => { state.running = null; });
+    return state.running;
 }
 
 app.get('/api/export/withdrawals', async (req, res) => {
@@ -1773,7 +1782,7 @@ app.get('/api/companies/:companyId/withdrawals', authenticateToken, async (req, 
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
-        if (!(await isWiseCompany(companyId))) return res.json({ start_month: withdrawals.START_MONTH, items: [] });
+        if (!(await wiseEnvFor(companyId))) return res.json({ start_month: withdrawals.START_MONTH, items: [] });
         syncWithdrawals(companyId).catch(e => console.error('Prelievi: lettura estratto:', e.message));
         res.json({ start_month: withdrawals.START_MONTH, items: await withdrawals.allItems(pool, companyId) });
     } catch (error) {
@@ -1787,9 +1796,9 @@ app.post('/api/companies/:companyId/wise/recipients', authenticateToken, async (
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
-        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
-        if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
-        const made = await wise.clientFromEnv(process.env).createIbanRecipient(req.body || {});
+        const wiseEnv = await wiseEnvFor(companyId);
+        if (!wiseEnv) return res.status(400).json(NOT_WISE_COMPANY);
+        const made = await wise.clientFromEnv(wiseEnv).createIbanRecipient(req.body || {});
         res.status(201).json(made);
     } catch (error) {
         wiseFail(res, error, 'Errore nella creazione del beneficiario');
