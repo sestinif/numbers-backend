@@ -878,15 +878,16 @@ app.post('/api/companies/:companyId/recurring', authenticateToken, async (req, r
     if (end && end < start) return res.status(400).json({ error: 'La fine non può precedere l\'inizio' });
     const account = recurring.cleanAccount(req.body.account);
     const costType = recurring.normalizeCostType(req.body.cost_type);
+    const link = recurring.cleanLink(req.body.link);
 
     try {
         const check = await pool.query('SELECT id, name FROM companies WHERE id = $1 AND user_id = $2', [companyId, req.user.id]);
         if (check.rows.length === 0) return res.status(404).json({ error: 'Azienda non trovata' });
 
         const result = await pool.query(
-            `INSERT INTO recurring_rules (company_id, name, amount, category, frequency, day_of_month, start_period, end_period, account, cost_type)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-            [companyId, name.trim(), amount, category || null, freq, day, start, end, account, costType]
+            `INSERT INTO recurring_rules (company_id, name, amount, category, frequency, day_of_month, start_period, end_period, account, cost_type, link)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+            [companyId, name.trim(), amount, category || null, freq, day, start, end, account, costType, link]
         );
         // Materializza subito le voci dei mesi già dovuti, così compaiono senza aspettare
         try { await recurring.materialize(pool, companyId); } catch (e) { console.error('Materializzazione post-create:', e.message); }
@@ -919,12 +920,14 @@ app.put('/api/recurring/:id', authenticateToken, async (req, res) => {
         // Conto e tipo cambiano solo se la richiesta li porta. Valgono per i mesi nuovi, come l'importo.
         const account = req.body.account !== undefined ? recurring.cleanAccount(req.body.account) : (rule.account || null);
         const costType = recurring.normalizeCostType(req.body.cost_type, recurring.normalizeCostType(rule.cost_type));
+        // Il link cambia solo se la richiesta lo porta; vuoto o non valido lo toglie.
+        const link = req.body.link !== undefined ? recurring.cleanLink(req.body.link) : (rule.link || null);
 
         const result = await pool.query(
             `UPDATE recurring_rules SET name=$1, amount=$2, category=$3, frequency=$4, day_of_month=$5, end_period=$6,
-                    account=$7, cost_type=$8, updated_at=CURRENT_TIMESTAMP
-             WHERE id=$9 RETURNING *`,
-            [name, amount, category, frequency, day, end, account, costType, id]
+                    account=$7, cost_type=$8, link=$9, updated_at=CURRENT_TIMESTAMP
+             WHERE id=$10 RETURNING *`,
+            [name, amount, category, frequency, day, end, account, costType, link, id]
         );
         res.json(result.rows[0]);
     } catch (error) {
@@ -2009,6 +2012,12 @@ async function runMigrations() {
         await withdrawals.ensureTables(pool);
         results.push('M15: wise_outgoing e quota prelievo ✅');
     } catch (e) { results.push('M15 skipped: ' + e.message); }
+
+    // Migration 16: link di controllo (dashboard del fornitore) sulle regole ricorrenti.
+    try {
+        await pool.query(`ALTER TABLE recurring_rules ADD COLUMN IF NOT EXISTS link VARCHAR(500)`);
+        results.push('M16: recurring_rules.link ✅');
+    } catch (e) { results.push('M16 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;

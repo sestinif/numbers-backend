@@ -97,3 +97,15 @@ test('cambio conto in blocco: scelta di da/a, e cosa dice la condizione SQL', ()
     assert.deepStrictEqual(R.accountMoveWhere({ mode: 'name', name: 'Revolut Business' }, 3), { sql: 'LOWER(TRIM(account)) = LOWER($3)', params: ['Revolut Business'] });
     assert.match(R.accountMoveWhere({ mode: 'none' }, 3).sql, /IS NULL/);
 });
+
+test('link di controllo: solo https e senza spazi, il resto diventa vuoto', () => {
+    assert.strictEqual(R.cleanLink(' https://dashboard.render.com/billing '), 'https://dashboard.render.com/billing');
+    assert.strictEqual(R.cleanLink('https://console.apify.com/billing?x=1'), 'https://console.apify.com/billing?x=1');
+    assert.strictEqual(R.cleanLink('http://example.com'), null, 'niente http');
+    assert.strictEqual(R.cleanLink('javascript:alert(1)'), null);
+    assert.strictEqual(R.cleanLink('https://exa mple.com'), null, 'niente spazi');
+    assert.strictEqual(R.cleanLink('render.com/billing'), null);
+    assert.strictEqual(R.cleanLink(''), null);
+    assert.strictEqual(R.cleanLink(null), null);
+    assert.strictEqual(R.cleanLink('https://a.com/' + 'x'.repeat(500)), null, 'oltre 500 caratteri');
+});

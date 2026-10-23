@@ -55,6 +55,13 @@ function cleanAccount(value) {
     return v || null;
 }
 
+// Il link dove controllare la fattura o il consumo (dashboard del fornitore). Solo https, niente spazi.
+function cleanLink(value) {
+    const v = String(value == null ? '' : value).trim();
+    if (!v || v.length > 500 || /\s/.test(v)) return null;
+    return /^https:\/\/[^/]+\.[^/]+/i.test(v) ? v : null;
+}
+
 // Cambio di conto in blocco: da quale conto (uno, «tutti», o «nessuno» = senza conto) a quale.
 // Ritorna { error } o { from: { mode: 'all' | 'none' | 'name', name }, to }.
 function planAccountMove(body) {
@@ -131,4 +138,4 @@ async function afterExpenseSaved(pool, expense) {
     return { confirmed: true };
 }
 
-module.exports = { materialize, afterExpenseSaved, normalizeCostType, cleanAccount, planAccountMove, accountMoveWhere, currentPeriod, ym, clampDay };
+module.exports = { materialize, afterExpenseSaved, normalizeCostType, cleanAccount, cleanLink, planAccountMove, accountMoveWhere, currentPeriod, ym, clampDay };
