@@ -1814,6 +1814,16 @@ app.get('/api/companies/:companyId/inbox', authenticateToken, async (req, res) =
     }
 });
 
+app.get('/api/companies/:companyId/inbox/unread', authenticateToken, inboxLimiter, async (req, res) => {
+    try {
+        const cfg = await inboxGuard(req, res);
+        if (!cfg) return;
+        res.json(await inbox.unreadUids(cfg));
+    } catch (error) {
+        inboxFail(res, error, 'Errore email non lette');
+    }
+});
+
 app.get('/api/companies/:companyId/inbox/folders', authenticateToken, inboxLimiter, async (req, res) => {
     try {
         const cfg = await inboxGuard(req, res);

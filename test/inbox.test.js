@@ -96,7 +96,7 @@ test('gli errori del server sono in italiano e non sono mai 401/403', () => {
 });
 
 // ---- Una casella finta, per provare il flusso senza server vero ----
-function fakeClient({ messages, raw, failConnect } = {}) {
+function fakeClient({ messages, raw, failConnect, unread } = {}) {
     const log = { opened: [], readOnly: [], fetched: [], loggedOut: false, flagsChanged: 0 };
     const client = {
         on() {},
@@ -107,6 +107,7 @@ function fakeClient({ messages, raw, failConnect } = {}) {
         async getMailboxLock(folder, opts) { log.opened.push(folder); log.readOnly.push(opts && opts.readOnly); return { release() {} }; },
         fetch(range) { log.fetched.push(range); const [a, b] = range.split(':').map(Number); const slice = messages.slice(a - 1, b); return (async function* () { for (const m of slice) yield m; })(); },
         async fetchOne(uid) { log.fetched.push('uid:' + uid); return raw ? { source: Buffer.from(raw) } : false; },
+        async search(query) { log.searched = query; return unread || []; },
         async messageFlagsAdd() { log.flagsChanged++; },
         async messageDelete() { log.flagsChanged++; },
     };
@@ -180,4 +181,22 @@ test('cartelle: la casella arriva per prima e quelle non selezionabili non compa
 test('il modulo non ha nessuna funzione che scriva sulla casella', () => {
     const src = require('node:fs').readFileSync(require.resolve('../inbox'), 'utf8');
     assert.ok(!/messageDelete|messageFlagsAdd|messageFlagsSet|messageMove|messageCopy|append\(|\.mailboxCreate|\.mailboxDelete|mailboxRename|\.idle\(/.test(src.replace(/\/\/.*$/gm, '')), 'solo comandi di lettura');
+});
+
+test('non lette: una ricerca sola, in sola lettura, i più recenti per primi e al massimo 200', async () => {
+    const { client, log } = fakeClient({ unread: [5, 90, 12] });
+    const r = await inbox.unreadUids(inbox.config(ENV), () => client);
+    assert.deepStrictEqual(r, { count: 3, uids: [90, 12, 5] });
+    assert.deepStrictEqual(log.searched, { seen: false });
+    assert.deepStrictEqual(log.readOnly, [true]);
+    assert.deepStrictEqual(log.opened, ['INBOX']);
+    assert.strictEqual(log.loggedOut, true);
+    assert.strictEqual(log.flagsChanged, 0);
+    const many = fakeClient({ unread: Array.from({ length: 300 }, (_, i) => i + 1) });
+    const m = await inbox.unreadUids(inbox.config(ENV), () => many.client);
+    assert.strictEqual(m.count, 300);
+    assert.strictEqual(m.uids.length, 200);
+    assert.strictEqual(m.uids[0], 300);
+    const none = fakeClient({ unread: false });
+    assert.deepStrictEqual(await inbox.unreadUids(inbox.config(ENV), () => none.client), { count: 0, uids: [] });
 });

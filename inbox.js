@@ -18,6 +18,7 @@ const sanitizeHtml = require('sanitize-html');
 
 const PAGE_SIZE = 25;
 const MAX_FOLDER_LENGTH = 120;
+const MAX_UNREAD_UIDS = 200;
 const CONNECT_TIMEOUT_MS = 15000;
 const HOST_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i;
 
@@ -214,6 +215,21 @@ async function listMessages(cfg, folder, page, connect) {
     }, connect);
 }
 
+// Le email non lette nella casella: serve al pallino di «nuova email» che si vede in tutta l'app.
+// Una sola ricerca, in sola lettura. Ritorna i numeri dei messaggi (i più recenti per primi, al massimo 200).
+async function unreadUids(cfg, connect) {
+    return withClient(cfg, async client => {
+        const lock = await client.getMailboxLock('INBOX', { readOnly: true });
+        try {
+            const found = await client.search({ seen: false }, { uid: true });
+            const uids = (Array.isArray(found) ? found : []).slice().sort((a, b) => b - a);
+            return { count: uids.length, uids: uids.slice(0, MAX_UNREAD_UIDS) };
+        } finally {
+            lock.release();
+        }
+    }, connect);
+}
+
 // Un messaggio intero, già pulito. Si scarica con BODY.PEEK e la cartella è in sola lettura: resta «non letto».
 async function getMessage(cfg, folder, uid, { showImages = false } = {}, connect) {
     return withClient(cfg, async client => {
@@ -247,5 +263,5 @@ module.exports = {
     PAGE_SIZE, InboxError,
     config, isEnabledFor, cleanFolder, cleanUid, cleanPage, pageRange,
     sanitizeEmailHtml, hasRemoteImages, formatAddress, formatAddressList, describeError,
-    listFolders, listMessages, getMessage,
+    listFolders, listMessages, unreadUids, getMessage,
 };
