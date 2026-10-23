@@ -16,6 +16,8 @@ const wise = require('./wise');
 const accessCode = require('./access-code');
 const gmail = require('./gmail');
 const inbox = require('./inbox');
+const inboxSend = require('./inbox-send');
+const inboxActions = require('./inbox-actions');
 const mailLog = require('./mail-log');
 const wisePayments = require('./wise-payments');
 const withdrawals = require('./withdrawals');
@@ -68,7 +70,7 @@ app.use(cors({
 // Limite body JSON: 1MB (gli upload file passano da multer, non da JSON, quindi è sicuro)
 const jsonSmall = express.json({ limit: '1mb' });
 const jsonWithAttachments = express.json({ limit: '12mb' }); // solo per l'invio di un'email: porta gli allegati in base64
-app.use((req, res, next) => (/^\/api\/companies\/[^/]+\/email\/send$/.test(req.path) ? jsonWithAttachments : jsonSmall)(req, res, next));
+app.use((req, res, next) => (/^\/api\/companies\/[^/]+\/(email|inbox)\/send$/.test(req.path) ? jsonWithAttachments : jsonSmall)(req, res, next));
 app.use(express.static('../frontend'));
 
 // Rate limiting - protezione brute force
@@ -1549,11 +1551,38 @@ function wiseFail(res, error, fallback) {
     res.status(500).json({ error: fallback });
 }
 
+// Wise appartiene a una sola azienda (vedi wiseCompanyAllowed): dalle altre non si vede e non si paga niente.
+let wiseOwnerCache = { at: 0, id: undefined };
+async function detectedWiseCompany() {
+    if (wiseOwnerCache.id !== undefined && Date.now() - wiseOwnerCache.at < 5 * 60 * 1000) return wiseOwnerCache.id;
+    const r = await pool.query(
+        `SELECT company_id FROM (SELECT company_id, created_at AS t FROM wise_payments UNION ALL SELECT company_id, updated_at AS t FROM wise_recipient_labels) x
+         ORDER BY t ASC LIMIT 1`
+    );
+    wiseOwnerCache = { at: Date.now(), id: r.rows[0] ? r.rows[0].company_id : null };
+    return wiseOwnerCache.id;
+}
+async function isWiseCompany(companyId) {
+    return wisePayments.wiseCompanyAllowed(process.env.WISE_COMPANY_ID, await detectedWiseCompany(), companyId);
+}
+const NOT_WISE_COMPANY = { error: 'Wise non è collegato a questa azienda' };
+
+app.get('/api/companies/:companyId/wise/enabled', authenticateToken, async (req, res) => {
+    try {
+        if (!(await ownCompany(req.params.companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        res.json({ enabled: await isWiseCompany(req.params.companyId) });
+    } catch (error) {
+        console.error('Errore stato Wise:', error.message);
+        res.status(500).json({ error: 'Errore nel controllo di Wise' });
+    }
+});
+
 // Tutto quello che serve alla pagina: saldi, beneficiari, bonifici preparati con lo stato aggiornato.
 app.get('/api/companies/:companyId/wise', authenticateToken, async (req, res) => {
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!(await isWiseCompany(companyId))) return res.json({ configured: false, otherCompany: true });
         if (!wise.isConfigured(process.env)) return res.json({ configured: false });
         const client = wise.clientFromEnv(process.env);
         const [balances, recipients] = await Promise.all([client.balances(), client.recipients()]);
@@ -1573,6 +1602,7 @@ app.post('/api/companies/:companyId/wise/quote', authenticateToken, async (req, 
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
         if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
         const client = wise.clientFromEnv(process.env);
         const recipient = (await client.recipients()).find(r => String(r.id) === String(req.body.recipientId));
@@ -1596,6 +1626,7 @@ app.post('/api/companies/:companyId/wise/payments', authenticateToken, async (re
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
         if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
         const body = req.body || {};
         const sendNow = body.send === true;
@@ -1631,6 +1662,7 @@ app.post('/api/companies/:companyId/wise/payments/:paymentId/send', authenticate
     const { companyId, paymentId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
         if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
         const refused = checkPayPin(companyId, (req.body || {}).pin);
         if (refused) return res.status(refused.status).json({ error: refused.error });
@@ -1647,6 +1679,7 @@ app.post('/api/companies/:companyId/wise/payments/:paymentId/cancel', authentica
     const { companyId, paymentId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
         if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
         const row = await wisePayments.cancel(pool, wise.clientFromEnv(process.env), companyId, paymentId);
         res.json(wisePayments.publicPayment(row));
@@ -1660,6 +1693,7 @@ app.put('/api/companies/:companyId/wise/recipient-labels', authenticateToken, as
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
         const saved = await wisePayments.saveLabels(pool, companyId, req.body && req.body.labels);
         res.json({ saved, labels: await wisePayments.getLabels(pool, companyId), shares: await wisePayments.getShares(pool, companyId) });
     } catch (error) {
@@ -1739,6 +1773,7 @@ app.get('/api/companies/:companyId/withdrawals', authenticateToken, async (req, 
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!(await isWiseCompany(companyId))) return res.json({ start_month: withdrawals.START_MONTH, items: [] });
         syncWithdrawals(companyId).catch(e => console.error('Prelievi: lettura estratto:', e.message));
         res.json({ start_month: withdrawals.START_MONTH, items: await withdrawals.allItems(pool, companyId) });
     } catch (error) {
@@ -1752,6 +1787,7 @@ app.post('/api/companies/:companyId/wise/recipients', authenticateToken, async (
     const { companyId } = req.params;
     try {
         if (!(await ownCompany(companyId, req.user.id))) return res.status(404).json({ error: 'Azienda non trovata' });
+        if (!(await isWiseCompany(companyId))) return res.status(404).json(NOT_WISE_COMPANY);
         if (!wise.isConfigured(process.env)) return res.status(400).json({ error: 'Wise non è collegato' });
         const made = await wise.clientFromEnv(process.env).createIbanRecipient(req.body || {});
         res.status(201).json(made);
@@ -1821,6 +1857,103 @@ app.get('/api/companies/:companyId/inbox/unread', authenticateToken, inboxLimite
         res.json(await inbox.unreadUids(cfg));
     } catch (error) {
         inboxFail(res, error, 'Errore email non lette');
+    }
+});
+
+// Invio e azioni sulla casella: ognuna parte da un clic di Federico su UN messaggio.
+const inboxSendLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 12,
+    message: { error: 'Troppi invii in poco tempo. Riprova tra un minuto.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+function inboxActionFail(res, error, fallback) {
+    if (error instanceof gmail.MailError) {
+        return res.status(error.status === 401 || error.status === 403 ? 502 : error.status).json({ error: error.message });
+    }
+    inboxFail(res, error, fallback);
+}
+
+app.post('/api/companies/:companyId/inbox/send', authenticateToken, inboxSendLimiter, async (req, res) => {
+    try {
+        const cfg = await inboxGuard(req, res);
+        if (!cfg) return;
+        const out = inboxSend.validateOutgoing(req.body);
+        const sentToday = await mailLog.countToday(pool, req.params.companyId);
+        if (sentToday >= inboxSend.dailyLimit(process.env)) {
+            return res.status(429).json({ error: `Tetto di sicurezza raggiunto: oggi sono già partite ${sentToday} email. Riprova domani.` });
+        }
+        const result = await inboxSend.send(inboxSend.sendConfig(process.env), out);
+        try {
+            await mailLog.record(pool, req.params.companyId, { to: out.to.concat(out.cc), subject: out.subject, text: out.text, attachments: out.attachments, invoiceId: req.body.invoiceId, gmailId: (result.messageId || '').slice(0, 64) });
+        } catch (e) { console.error('Posta: invio non registrato:', e.message); }
+        res.status(201).json({ ok: true, savedToSent: result.savedToSent });
+    } catch (error) {
+        inboxActionFail(res, error, 'Errore nell\'invio dalla casella');
+    }
+});
+
+app.post('/api/companies/:companyId/inbox/messages/:uid/seen', authenticateToken, inboxLimiter, async (req, res) => {
+    try {
+        const cfg = await inboxGuard(req, res);
+        if (!cfg) return;
+        const folder = inbox.cleanFolder((req.body || {}).folder);
+        const uid = inbox.cleanUid(req.params.uid);
+        if (!folder || !uid) return res.status(400).json({ error: 'Richiesta non valida' });
+        res.json(await inboxActions.setSeen(cfg, folder, uid, (req.body || {}).seen !== false));
+    } catch (error) {
+        inboxActionFail(res, error, 'Errore nel segnare letta/non letta');
+    }
+});
+
+app.post('/api/companies/:companyId/inbox/messages/:uid/move', authenticateToken, inboxLimiter, async (req, res) => {
+    try {
+        const cfg = await inboxGuard(req, res);
+        if (!cfg) return;
+        const folder = inbox.cleanFolder((req.body || {}).folder);
+        const to = inbox.cleanFolder((req.body || {}).to);
+        const uid = inbox.cleanUid(req.params.uid);
+        if (!folder || !to || !uid) return res.status(400).json({ error: 'Richiesta non valida' });
+        res.json(await inboxActions.moveMessage(cfg, folder, uid, to));
+    } catch (error) {
+        inboxActionFail(res, error, 'Errore nello spostamento');
+    }
+});
+
+app.post('/api/companies/:companyId/inbox/messages/:uid/delete', authenticateToken, inboxLimiter, async (req, res) => {
+    try {
+        const cfg = await inboxGuard(req, res);
+        if (!cfg) return;
+        const folder = inbox.cleanFolder((req.body || {}).folder);
+        const uid = inbox.cleanUid(req.params.uid);
+        if (!folder || !uid) return res.status(400).json({ error: 'Richiesta non valida' });
+        res.json(await inboxActions.deleteMessage(cfg, folder, uid));
+    } catch (error) {
+        inboxActionFail(res, error, 'Errore nell\'eliminazione');
+    }
+});
+
+app.get('/api/companies/:companyId/inbox/messages/:uid/attachments/:index', authenticateToken, inboxLimiter, async (req, res) => {
+    try {
+        const cfg = await inboxGuard(req, res);
+        if (!cfg) return;
+        const folder = inbox.cleanFolder(req.query.folder);
+        const uid = inbox.cleanUid(req.params.uid);
+        const index = inboxActions.cleanIndex(req.params.index);
+        if (!folder || !uid || index === null) return res.status(400).json({ error: 'Richiesta non valida' });
+        const file = await inboxActions.getAttachment(cfg, folder, uid, index);
+        // Sempre scaricato, mai aperto nella pagina: un allegato non fidato non deve poter eseguire niente.
+        res.set({
+            'Content-Type': 'application/octet-stream',
+            'Content-Disposition': `attachment; filename="${inboxActions.safeDownloadName(file.filename)}"; filename*=UTF-8''${encodeURIComponent(inboxActions.safeDownloadName(file.filename))}`,
+            'X-Content-Type-Options': 'nosniff',
+            'Content-Length': String(file.content.length),
+        });
+        res.end(file.content);
+    } catch (error) {
+        inboxActionFail(res, error, 'Errore nello scarico dell\'allegato');
     }
 });
 

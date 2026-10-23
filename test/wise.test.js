@@ -265,3 +265,16 @@ test('il modulo non legge mai la posta... né muove soldi leggendo l\'estratto: 
     await wise.createClient({ token: 't', fetchImpl }).statement(3, 'EUR', 'a', 'b');
     assert.ok(calls.every(c => c.key.startsWith('GET ')));
 });
+
+test('Wise appartiene a una sola azienda: le altre non la vedono', () => {
+    const wp = require('../wise-payments');
+    assert.strictEqual(wp.wiseCompanyAllowed('13', 13, 13), true);
+    assert.strictEqual(wp.wiseCompanyAllowed('13', 13, '13'), true);
+    assert.strictEqual(wp.wiseCompanyAllowed('13', 13, 14), false, 'Oakstone non usa Wise di Scaling');
+    assert.strictEqual(wp.wiseCompanyAllowed(undefined, 13, 14), false, 'senza la variabile vale l\'azienda che ha già bonifici');
+    assert.strictEqual(wp.wiseCompanyAllowed(undefined, 13, 13), true);
+    assert.strictEqual(wp.wiseCompanyAllowed('14', 13, 14), true, 'la variabile vince su ciò che si deduce');
+    assert.strictEqual(wp.wiseCompanyAllowed('14', 13, 13), false);
+    assert.strictEqual(wp.wiseCompanyAllowed(undefined, null, 14), true, 'collegamento nuovo: nessuna restrizione');
+    assert.strictEqual(wp.wiseCompanyAllowed('', null, 14), true);
+});

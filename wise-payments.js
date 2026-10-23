@@ -52,6 +52,15 @@ async function ensureTable(pool) {
         )`);
 }
 
+// Wise è collegato a UN'azienda: quella del token. Le altre non devono vedere né muovere quei soldi.
+// `configured` = WISE_COMPANY_ID su Render; `detected` = l'azienda che ha già bonifici o nomi di beneficiari
+// (serve finché la variabile non c'è). Se non c'è né l'una né l'altra, nessuna restrizione (collegamento nuovo).
+function wiseCompanyAllowed(configured, detected, companyId) {
+    const fixed = parseInt(configured, 10);
+    const owner = fixed > 0 ? fixed : (detected == null ? null : Number(detected));
+    return owner === null || String(owner) === String(companyId);
+}
+
 function cleanLabel(value) {
     return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, 60);
 }
@@ -375,4 +384,4 @@ async function cancel(pool, client, companyId, paymentId) {
     return up.rows[0];
 }
 
-module.exports = { TRACK_EXPENSES, ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, send, cancel, getLabels, getShares, saveLabels, cleanLabel };
+module.exports = { TRACK_EXPENSES, ensureTable, listPayments, publicPayment, trackExpense, refresh, prepare, send, cancel, getLabels, getShares, saveLabels, cleanLabel, wiseCompanyAllowed };

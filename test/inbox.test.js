@@ -178,7 +178,7 @@ test('cartelle: la casella arriva per prima e quelle non selezionabili non compa
     assert.deepStrictEqual(f.map(x => x.path), ['INBOX', 'Sent']);
 });
 
-test('il modulo non ha nessuna funzione che scriva sulla casella', () => {
+test('il modulo di lettura non ha nessuna funzione che scriva sulla casella (le azioni stanno in altri file)', () => {
     const src = require('node:fs').readFileSync(require.resolve('../inbox'), 'utf8');
     assert.ok(!/messageDelete|messageFlagsAdd|messageFlagsSet|messageMove|messageCopy|append\(|\.mailboxCreate|\.mailboxDelete|mailboxRename|\.idle\(/.test(src.replace(/\/\/.*$/gm, '')), 'solo comandi di lettura');
 });

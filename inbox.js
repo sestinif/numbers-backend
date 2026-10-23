@@ -1,9 +1,9 @@
-// Numbers — la casella email di UNA azienda, in SOLA LETTURA (IMAP).
+// Numbers — la casella email di UNA azienda: la LETTURA (IMAP). Questo file non scrive mai.
 //
-// Serve a leggere la posta dell'azienda dentro Numbers, senza aprire la webmail. Non scrive niente:
-// la casella si apre in lettura (EXAMINE), i messaggi si scaricano senza segnarli come letti, e qui
-// non esiste nessuna chiamata che sposti, cancelli, segni o invii. Per rispondere o scrivere si usa
-// la webmail, come sempre.
+// Serve a leggere la posta dell'azienda dentro Numbers, senza aprire la webmail. Qui la casella si apre
+// in lettura (EXAMINE) e i messaggi si scaricano senza segnarli come letti: nessuna chiamata che sposti,
+// cancelli o segni. Le azioni (letta, sposta, elimina, allegati) stanno in inbox-actions.js e l'invio
+// in inbox-send.js, ognuna comandata da un clic di Federico.
 //
 // Variabili su Render (tutte obbligatorie, tranne le ultime due):
 //   IMAP_COMPANY_ID   l'id dell'azienda di Numbers che vede la sezione (solo quella)
@@ -248,10 +248,14 @@ async function getMessage(cfg, folder, uid, { showImages = false } = {}, connect
                 to: formatAddressList(mail.to && mail.to.value),
                 cc: formatAddressList(mail.cc && mail.cc.value),
                 date: mail.date ? mail.date.toISOString() : null,
+                // Serve a rispondere: l'indirizzo a cui scrivere e gli id che tengono la risposta nello stesso filo.
+                replyTo: formatAddressList((mail.replyTo && mail.replyTo.value) || (mail.from && mail.from.value))[0] || '',
+                messageId: mail.messageId || '',
+                references: [].concat(mail.references || []).filter(Boolean).slice(-20),
                 html: rawHtml ? sanitizeEmailHtml(rawHtml, { showImages }) : '',
                 text: mail.text || '',
                 imagesBlocked: !!rawHtml && !showImages && hasRemoteImages(rawHtml),
-                attachments: (mail.attachments || []).map(a => ({ filename: a.filename || '(senza nome)', size: a.size || 0, contentType: a.contentType || '' })),
+                attachments: (mail.attachments || []).filter(a => a.content).map(a => ({ filename: a.filename || '(senza nome)', size: a.size || 0, contentType: a.contentType || '' })),
             };
         } finally {
             lock.release();
@@ -264,4 +268,5 @@ module.exports = {
     config, isEnabledFor, cleanFolder, cleanUid, cleanPage, pageRange,
     sanitizeEmailHtml, hasRemoteImages, formatAddress, formatAddressList, describeError,
     listFolders, listMessages, unreadUids, getMessage,
+    realConnect, withClient,
 };
