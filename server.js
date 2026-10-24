@@ -768,8 +768,8 @@ app.post('/api/companies/:companyId/expenses', authenticateToken, async (req, re
         try { money = await currency.toEurAmount(amount, req.body.currency, date, aiCosts.toEurRate); }
         catch (e) { return res.status(502).json({ error: 'Cambio euro/dollaro non disponibile in questo momento. Riprova tra poco.' }); }
         const result = await pool.query(
-            'INSERT INTO expenses (company_id, description, amount, category, date, notes, account, currency, amount_original) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
-            [companyId, description, money.eur, category, date, notes, account, money.currency, money.original]
+            'INSERT INTO expenses (company_id, description, amount, category, date, notes, account, currency, amount_original, link) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *',
+            [companyId, description, money.eur, category, date, notes, account, money.currency, money.original, recurring.cleanLink(req.body.link)]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -812,6 +812,11 @@ app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
                 'UPDATE expenses SET description = $1, amount = $2, category = $3, date = $4, notes = $5, currency = $6, amount_original = $7, updated_at = CURRENT_TIMESTAMP WHERE id = $8 RETURNING *',
                 [description, money.eur, category, date, notes, money.currency, money.original, id]);
         let saved = result.rows[0];
+        // Il sito cambia solo se la richiesta lo porta; vuoto o non valido lo toglie.
+        if (req.body.link !== undefined) {
+            const linked = await pool.query('UPDATE expenses SET link = $1 WHERE id = $2 RETURNING *', [recurring.cleanLink(req.body.link), id]);
+            saved = linked.rows[0] || saved;
+        }
         // Voce di una regola variabile: salvarla vuol dire confermare la cifra del mese.
         try {
             const done = await recurring.afterExpenseSaved(pool, saved);
@@ -2263,6 +2268,12 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE recurring_rules ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'EUR'`);
         results.push('M17: valuta su spese e regole ✅');
     } catch (e) { results.push('M17 skipped: ' + e.message); }
+
+    // Migration 18: sito del fornitore anche sulle spese (dà il logo nella lista).
+    try {
+        await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS link VARCHAR(500)`);
+        results.push('M18: expenses.link ✅');
+    } catch (e) { results.push('M18 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
