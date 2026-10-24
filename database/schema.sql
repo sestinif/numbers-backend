@@ -29,6 +29,8 @@ CREATE TABLE companies (
     email VARCHAR(255),
     tax_id VARCHAR(100),
     payment_info TEXT,
+    logo TEXT,
+    logo_invoice TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

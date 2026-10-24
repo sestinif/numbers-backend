@@ -23,6 +23,7 @@ const mailLog = require('./mail-log');
 const wisePayments = require('./wise-payments');
 const withdrawals = require('./withdrawals');
 const payPin = require('./pay-pin');
+const companyLogo = require('./company-logo');
 
 // Multer: memory storage, 5MB max, only images/pdf
 const receiptUpload = multer({
@@ -33,6 +34,12 @@ const receiptUpload = multer({
         if (!ok) return cb(new Error('Formato non supportato. Solo immagini o PDF.'));
         cb(null, true);
     }
+});
+
+// Logo dell'azienda: un file solo, SVG o PNG (il controllo vero è in company-logo.js).
+const logoUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: companyLogo.MAX_BYTES, files: 1 }
 });
 
 // Configure SendGrid
@@ -467,6 +474,50 @@ app.delete('/api/companies/:id', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Errore delete company:', error);
         res.status(500).json({ error: 'Errore nell\'eliminazione azienda' });
+    }
+});
+
+// Logo dell'azienda: ?kind=app (quello dell'app) o ?kind=invoice (la versione per le fatture).
+app.post('/api/companies/:id/logo', authenticateToken, (req, res) => {
+    logoUpload.single('file')(req, res, async (err) => {
+        if (err) {
+            const tooBig = err.code === 'LIMIT_FILE_SIZE';
+            return res.status(400).json({ error: tooBig ? 'Il logo pesa troppo: massimo 512 KB.' : err.message });
+        }
+        const column = companyLogo.columnFor(req.query.kind);
+        if (!column) return res.status(400).json({ error: 'Tipo di logo sconosciuto.' });
+        try {
+            const check = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+            if (check.rows.length === 0) return res.status(404).json({ error: 'Azienda non trovata' });
+            let dataUrl;
+            try { dataUrl = companyLogo.prepareLogo(req.file); }
+            catch (e) { return res.status(400).json({ error: e.message }); }
+            const result = await pool.query(
+                `UPDATE companies SET ${column} = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`,
+                [dataUrl, req.params.id]
+            );
+            res.json(result.rows[0]);
+        } catch (error) {
+            console.error('Errore upload logo:', error);
+            res.status(500).json({ error: 'Errore nel caricamento del logo' });
+        }
+    });
+});
+
+app.delete('/api/companies/:id/logo', authenticateToken, async (req, res) => {
+    const column = companyLogo.columnFor(req.query.kind);
+    if (!column) return res.status(400).json({ error: 'Tipo di logo sconosciuto.' });
+    try {
+        const check = await pool.query('SELECT id FROM companies WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+        if (check.rows.length === 0) return res.status(404).json({ error: 'Azienda non trovata' });
+        const result = await pool.query(
+            `UPDATE companies SET ${column} = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *`,
+            [req.params.id]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Errore rimozione logo:', error);
+        res.status(500).json({ error: 'Errore nella rimozione del logo' });
     }
 });
 
@@ -2274,6 +2325,12 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS link VARCHAR(500)`);
         results.push('M18: expenses.link ✅');
     } catch (e) { results.push('M18 skipped: ' + e.message); }
+
+    // Migration 19: logo dell'azienda (app) e versione per le fatture.
+    try {
+        await companyLogo.ensureColumns(pool);
+        results.push('M19: companies.logo e logo_invoice ✅');
+    } catch (e) { results.push('M19 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;
