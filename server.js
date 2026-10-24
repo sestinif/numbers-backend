@@ -12,6 +12,7 @@ const helmet = require('helmet');
 require('dotenv').config();
 const aiCosts = require('./ai-costs');
 const recurring = require('./recurring');
+const currency = require('./currency');
 const wise = require('./wise');
 const accessCode = require('./access-code');
 const gmail = require('./gmail');
@@ -729,7 +730,7 @@ app.get('/api/companies/:companyId/expenses', authenticateToken, async (req, res
         // Aggiorna le voci automatiche delle spese API (OpenAI/Gemini), al massimo una volta l'ora
         await aiCosts.syncIfStale(pool, check.rows[0]);
         // Materializza le spese ricorrenti attive (crea le righe dei mesi mancanti)
-        try { await recurring.materialize(pool, companyId); }
+        try { await recurring.materialize(pool, companyId, new Date(), aiCosts.toEurRate); }
         catch (e) { console.error('Errore materializzazione ricorrenti:', e.message); }
 
         const result = await pool.query(
@@ -763,9 +764,12 @@ app.post('/api/companies/:companyId/expenses', authenticateToken, async (req, re
             return res.status(404).json({ error: 'Azienda non trovata' });
         }
 
+        let money;
+        try { money = await currency.toEurAmount(amount, req.body.currency, date, aiCosts.toEurRate); }
+        catch (e) { return res.status(502).json({ error: 'Cambio euro/dollaro non disponibile in questo momento. Riprova tra poco.' }); }
         const result = await pool.query(
-            'INSERT INTO expenses (company_id, description, amount, category, date, notes, account) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-            [companyId, description, amount, category, date, notes, account]
+            'INSERT INTO expenses (company_id, description, amount, category, date, notes, account, currency, amount_original) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
+            [companyId, description, money.eur, category, date, notes, account, money.currency, money.original]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -786,21 +790,27 @@ app.put('/api/expenses/:id', authenticateToken, async (req, res) => {
     try {
         // Check ownership
         const check = await pool.query(
-            'SELECT e.id FROM expenses e JOIN companies co ON e.company_id = co.id WHERE e.id = $1 AND co.user_id = $2',
+            'SELECT e.id, e.currency FROM expenses e JOIN companies co ON e.company_id = co.id WHERE e.id = $1 AND co.user_id = $2',
             [id, req.user.id]
         );
         if (check.rows.length === 0) {
             return res.status(404).json({ error: 'Spesa non trovata' });
         }
 
+        // La valuta cambia solo se la richiesta la porta: senza, la cifra è nella valuta che la spesa ha già.
+        let money;
+        try {
+            money = await currency.toEurAmount(amount, req.body.currency !== undefined ? req.body.currency : check.rows[0].currency, date, aiCosts.toEurRate);
+        } catch (e) { return res.status(502).json({ error: 'Cambio euro/dollaro non disponibile in questo momento. Riprova tra poco.' }); }
+
         // Il conto cambia solo se la richiesta lo porta: una pagina vecchia che non lo manda non lo cancella.
         const result = req.body.account !== undefined
             ? await pool.query(
-                'UPDATE expenses SET description = $1, amount = $2, category = $3, date = $4, notes = $5, account = $6, updated_at = CURRENT_TIMESTAMP WHERE id = $7 RETURNING *',
-                [description, amount, category, date, notes, recurring.cleanAccount(req.body.account), id])
+                'UPDATE expenses SET description = $1, amount = $2, category = $3, date = $4, notes = $5, account = $6, currency = $7, amount_original = $8, updated_at = CURRENT_TIMESTAMP WHERE id = $9 RETURNING *',
+                [description, money.eur, category, date, notes, recurring.cleanAccount(req.body.account), money.currency, money.original, id])
             : await pool.query(
-                'UPDATE expenses SET description = $1, amount = $2, category = $3, date = $4, notes = $5, updated_at = CURRENT_TIMESTAMP WHERE id = $6 RETURNING *',
-                [description, amount, category, date, notes, id]);
+                'UPDATE expenses SET description = $1, amount = $2, category = $3, date = $4, notes = $5, currency = $6, amount_original = $7, updated_at = CURRENT_TIMESTAMP WHERE id = $8 RETURNING *',
+                [description, money.eur, category, date, notes, money.currency, money.original, id]);
         let saved = result.rows[0];
         // Voce di una regola variabile: salvarla vuol dire confermare la cifra del mese.
         try {
@@ -888,12 +898,12 @@ app.post('/api/companies/:companyId/recurring', authenticateToken, async (req, r
         if (check.rows.length === 0) return res.status(404).json({ error: 'Azienda non trovata' });
 
         const result = await pool.query(
-            `INSERT INTO recurring_rules (company_id, name, amount, category, frequency, day_of_month, start_period, end_period, account, cost_type, link)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-            [companyId, name.trim(), amount, category || null, freq, day, start, end, account, costType, link]
+            `INSERT INTO recurring_rules (company_id, name, amount, category, frequency, day_of_month, start_period, end_period, account, cost_type, link, currency)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+            [companyId, name.trim(), amount, category || null, freq, day, start, end, account, costType, link, currency.normalizeCurrency(req.body.currency)]
         );
         // Materializza subito le voci dei mesi già dovuti, così compaiono senza aspettare
-        try { await recurring.materialize(pool, companyId); } catch (e) { console.error('Materializzazione post-create:', e.message); }
+        try { await recurring.materialize(pool, companyId, new Date(), aiCosts.toEurRate); } catch (e) { console.error('Materializzazione post-create:', e.message); }
         res.status(201).json(result.rows[0]);
     } catch (error) {
         console.error('Errore create ricorrente:', error);
@@ -928,9 +938,11 @@ app.put('/api/recurring/:id', authenticateToken, async (req, res) => {
 
         const result = await pool.query(
             `UPDATE recurring_rules SET name=$1, amount=$2, category=$3, frequency=$4, day_of_month=$5, end_period=$6,
-                    account=$7, cost_type=$8, link=$9, updated_at=CURRENT_TIMESTAMP
-             WHERE id=$10 RETURNING *`,
-            [name, amount, category, frequency, day, end, account, costType, link, id]
+                    account=$7, cost_type=$8, link=$9, currency=$10, updated_at=CURRENT_TIMESTAMP
+             WHERE id=$11 RETURNING *`,
+            [name, amount, category, frequency, day, end, account, costType, link,
+             // Come l'importo, la valuta vale per i mesi nuovi; senza, resta quella di prima.
+             currency.normalizeCurrency(req.body.currency, currency.normalizeCurrency(rule.currency)), id]
         );
         res.json(result.rows[0]);
     } catch (error) {
@@ -2242,6 +2254,15 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE recurring_rules ADD COLUMN IF NOT EXISTS link VARCHAR(500)`);
         results.push('M16: recurring_rules.link ✅');
     } catch (e) { results.push('M16 skipped: ' + e.message); }
+
+    // Migration 17: spese e regole in euro o in dollari. `amount` resta in euro; la cifra scritta
+    // in un'altra valuta va in `amount_original`.
+    try {
+        await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'EUR'`);
+        await pool.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS amount_original DECIMAL(12, 2)`);
+        await pool.query(`ALTER TABLE recurring_rules ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NOT NULL DEFAULT 'EUR'`);
+        results.push('M17: valuta su spese e regole ✅');
+    } catch (e) { results.push('M17 skipped: ' + e.message); }
 
     console.log('Migrations:', results.join(' | '));
     return results;

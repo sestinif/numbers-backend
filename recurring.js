@@ -20,6 +20,8 @@
 //   finché lui non la salva con la cifra della fattura. Confermare un mese NON cambia la stima
 //   della regola: i mesi dopo nascono ancora dalla stima.
 
+const { toEurAmount, normalizeCurrency } = require('./currency');
+
 const MAX_MONTHS = 600; // paracadute anti-loop (50 anni)
 
 function ym(year, month /* 1-12 */) {
@@ -87,7 +89,9 @@ function isoDate(year, month, day) {
 
 // Materializza le voci mancanti per tutte le regole attive dell'azienda.
 // Idempotente: chiamabile a ogni apertura delle spese, crea solo ciò che manca.
-async function materialize(pool, companyId, now = new Date()) {
+// Una regola in dollari genera la voce in euro al cambio BCE del giorno (toEurRate di ai-costs);
+// se il cambio non arriva, quel mese salta e si riprova alla prossima apertura.
+async function materialize(pool, companyId, now = new Date(), toEurRate = null) {
     const cur = currentPeriod(now);
     const { rows: rules } = await pool.query(
         `SELECT * FROM recurring_rules WHERE company_id = $1 AND active = TRUE`,
@@ -111,14 +115,21 @@ async function materialize(pool, companyId, now = new Date()) {
                 const notes = `Voce ricorrente "${rule.name}". Generata in automatico ogni mese. ` +
                     `Se interrompi la regola i mesi già segnati restano; se cambi l'importo vale solo per i mesi nuovi.`;
                 const costType = normalizeCostType(rule.cost_type);
+                const cur = normalizeCurrency(rule.currency);
+                let money = { eur: rule.amount, original: null, currency: 'EUR' };
+                if (cur !== 'EUR') {
+                    if (!toEurRate) { m++; if (m > 12) { m = 1; y++; } continue; }
+                    try { money = await toEurAmount(rule.amount, cur, date, toEurRate, now); }
+                    catch (e) { m++; if (m > 12) { m = 1; y++; } continue; }
+                }
                 const r = await pool.query(
                     `INSERT INTO expenses (company_id, description, amount, category, date, notes, auto_source, auto_period,
-                                           account, cost_type, amount_confirmed)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                           account, cost_type, amount_confirmed, currency, amount_original)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                      ON CONFLICT (company_id, auto_source, auto_period) WHERE auto_source IS NOT NULL
                      DO NOTHING`,
-                    [companyId, rule.name, rule.amount, rule.category || null, date, notes, `rule:${rule.id}`, period,
-                     cleanAccount(rule.account), costType, costType !== 'variable']
+                    [companyId, rule.name, money.eur, rule.category || null, date, notes, `rule:${rule.id}`, period,
+                     cleanAccount(rule.account), costType, costType !== 'variable', money.currency, money.original]
                 );
                 created += r.rowCount;
             }

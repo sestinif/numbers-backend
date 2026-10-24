@@ -43,23 +43,25 @@ test('una regola fissa genera una voce già confermata, con conto e tipo', async
     assert.strictEqual(created, 1);
     const ins = pool.calls.find(c => c.sql.startsWith('INSERT INTO expenses'));
     assert.match(ins.sql, /account, cost_type, amount_confirmed/);
-    assert.deepStrictEqual(ins.params.slice(-3), ['Revolut Business', 'fixed', true]);
+    assert.deepStrictEqual(ins.params.slice(8, 11), ['Revolut Business', 'fixed', true]);
     assert.strictEqual(ins.params[7], '2026-10');
     assert.strictEqual(ins.params[4], '2026-10-14');
+    // Una regola in euro: la voce è in euro, senza cifra originale.
+    assert.deepStrictEqual(ins.params.slice(11), ['EUR', null]);
 });
 
 test('una regola variabile genera una voce da confermare', async () => {
     const pool = fakePool([{ match: /FROM recurring_rules/, result: { rows: [regola({ cost_type: 'variable' })] } }]);
     await R.materialize(pool, 1, OTT);
     const ins = pool.calls.find(c => c.sql.startsWith('INSERT INTO expenses'));
-    assert.deepStrictEqual(ins.params.slice(-3), ['Revolut Business', 'variable', false]);
+    assert.deepStrictEqual(ins.params.slice(8, 11), ['Revolut Business', 'variable', false]);
 });
 
 test('una regola di prima della migrazione (senza conto né tipo) vale come fissa', async () => {
     const pool = fakePool([{ match: /FROM recurring_rules/, result: { rows: [regola({ account: undefined, cost_type: undefined })] } }]);
     await R.materialize(pool, 1, OTT);
     const ins = pool.calls.find(c => c.sql.startsWith('INSERT INTO expenses'));
-    assert.deepStrictEqual(ins.params.slice(-3), [null, 'fixed', true]);
+    assert.deepStrictEqual(ins.params.slice(8, 11), [null, 'fixed', true]);
 });
 
 test('salvare la voce di una regola variabile la conferma, senza toccare la stima della regola', async () => {
